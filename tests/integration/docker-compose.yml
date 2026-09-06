@@ -1,0 +1,24 @@
+# NewProxy Rust 集成测试环境
+# 启动: docker compose -f tests/integration/docker-compose.yml up -d
+# 停止: docker compose -f tests/integration/docker-compose.yml down
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: newproxy-test-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: test_password
+      MYSQL_DATABASE: test
+    ports:
+      - "3306:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql

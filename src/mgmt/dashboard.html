@@ -1,0 +1,1486 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="utf-8">
+  <title>NewProxy 管理面板</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2029;
+      --border: #2a3342;
+      --text: #d7dee8;
+      --muted: #8b98ab;
+      --accent: #4f8cff;
+      --ok: #34c759;
+      --warn: #ff9500;
+      --err: #ff3b30;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+      padding: 16px;
+    }
+
+    header {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    header h1 {
+      font-size: 18px;
+    }
+
+    header .sub {
+      color: var(--muted);
+    }
+
+    header .status {
+      margin-left: auto;
+      color: var(--muted);
+    }
+
+    header .status.ok {
+      color: var(--ok);
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+
+    .card .k {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .card .v {
+      font-size: 20px;
+      font-weight: 600;
+      margin-top: 2px;
+    }
+
+    .card .v.warn {
+      color: var(--warn);
+    }
+
+    .card .v.err {
+      color: var(--err);
+    }
+
+    .charts {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .chart {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px;
+    }
+
+    .chart h3 {
+      font-size: 13px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .chart canvas {
+      width: 100%;
+      height: 140px;
+      display: block;
+    }
+
+    section.panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 14px;
+      overflow: hidden;
+    }
+
+    section.panel h2 {
+      font-size: 14px;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    section.panel h2 .actions {
+      margin-left: auto;
+    }
+
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 5px;
+      padding: 4px 10px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+
+    button:hover {
+      filter: brightness(1.15);
+    }
+
+    button.danger {
+      background: var(--err);
+    }
+
+    button.ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 500;
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+    }
+
+    td.sql {
+      max-width: 420px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, monospace;
+    }
+
+    tr:hover td {
+      background: #1e2733;
+    }
+
+    .mono {
+      font-family: ui-monospace, "SF Mono", monospace;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 14px;
+      text-align: center;
+    }
+
+    #toast {
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      background: #242c39;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 14px;
+      display: none;
+      z-index: 10;
+    }
+  </style>
+</head>
+
+<body>
+  <header>
+    <h1>NewProxy 管理面板</h1>
+    <span class="sub" id="version"></span><span class="sub" id="ui-rev" style="margin-left:8px;color:var(--warn);">UI
+      rev 2026-09-01g</span>
+    <span class="status" id="conn-status">连接中…</span>
+    <button id="check-btn" onclick="runHealthCheck()">一键检测</button>
+  </header>
+
+  <div id="check-result"
+    style="display:none;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:12px 14px;margin-bottom:14px;">
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="cards" id="stage-cards">
+    <div class="card">
+      <div class="k">平均耗时·命令间隔(µs)</div>
+      <div class="v" id="st-interval">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·解析(µs)</div>
+      <div class="v" id="st-parse">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·后端准备(µs)</div>
+      <div class="v" id="st-setup">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·发送(µs)</div>
+      <div class="v" id="st-send">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·后端执行+转发(µs)</div>
+      <div class="v" id="st-forward">-</div>
+    </div>
+  </div>
+
+  <div class="charts">
+    <div class="chart">
+      <h3>QPS(每秒查询)</h3><canvas id="ch-qps"></canvas>
+    </div>
+    <div class="chart">
+      <h3>活跃连接</h3><canvas id="ch-conn"></canvas>
+    </div>
+    <div class="chart">
+      <h3>平均延迟(µs)</h3><canvas id="ch-lat"></canvas>
+    </div>
+    <div class="chart">
+      <h3>流量(B/s) · 最近10分钟 <span style="color:var(--muted);font-size:11px;">蓝=接收 橙=发送</span></h3>
+      <canvas id="ch-traffic"></canvas>
+    </div>
+    <div class="chart">
+      <h3>网络包(包/s) · 最近10分钟 <span style="color:var(--muted);font-size:11px;">蓝=收包 橙=发包</span></h3>
+      <canvas id="ch-pkts"></canvas>
+    </div>
+  </div>
+
+  <section class="panel">
+    <h2>分片阶段耗时<span class="sub">（各分片平均 5 阶段耗时 µs，查询数来自分片计数，2s 自动刷新）</span></h2>
+    <table id="shard-stage-table">
+      <thead>
+        <tr>
+          <th>分片</th>
+          <th>查询数</th>
+          <th>间隔(µs)</th>
+          <th>解析(µs)</th>
+          <th>后端准备(µs)</th>
+          <th>发送(µs)</th>
+          <th>后端执行+转发(µs)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td colspan="7" class="empty">加载中…</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>活跃连接 <span class="actions"><button class="ghost" onclick="refreshConnections()">刷新</button></span></h2>
+    <div class="sql-scroll">
+      <table id="conn-table">
+        <thead>
+          <tr>
+            <th>cid</th>
+            <th>客户端</th>
+            <th>用户</th>
+            <th>库</th>
+            <th>状态</th>
+            <th>后端</th>
+            <th>存活(s)</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="8" class="empty">加载中…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Top SQL<span class="sub">（前 100 条，每页 10）</span>
+      <span class="actions"><input id="sql-shard" placeholder="分片过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <button class="ghost" style="padding:3px 8px;" onclick="exportSql()">导出</button></span>
+    </h2>
+    <div class="sql-scroll">
+      <table id="sql-table" class="sql-table">
+        <thead>
+          <tr>
+            <th>SQL 模板</th>
+            <th>分片</th>
+            <th>次数</th>
+            <th>平均(µs)</th>
+            <th>最大(µs)</th>
+            <th>行数</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="6" class="empty">加载中…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="sql-pager" style="padding:8px 12px;border-top:1px solid var(--border);"></div>
+  </section>
+
+  <section class="panel">
+    <h2>查询统计（单次 5 阶段耗时，最多 500 条）
+      <span class="actions">
+        <!-- <input id="recent-sql" placeholder="SQL过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;"> -->
+        <input id="recent-db" placeholder="库过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <input id="recent-user" placeholder="用户过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <input id="recent-shard" placeholder="分片过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <button style="padding:4px 12px;font-weight:600;" onclick="refreshRecent()">⟳ 刷新</button>
+        <span id="recent-ts" style="color:var(--muted);font-size:11px;"></span>
+        <button class="ghost" style="padding:3px 8px;" onclick="clearRecentFilters()">清除过滤</button>
+        <button id="recent-clear" class="danger" style="padding:3px 8px;">清除</button>
+        <button class="ghost" style="padding:3px 8px;" onclick="exportRecent()">导出</button>
+      </span>
+    </h2>
+    <div class="sql-scroll">
+      <table id="recent-table" class="sql-table">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>SQL</th>
+            <th>库</th>
+            <th>用户</th>
+            <th>分片</th>
+            <th class="sortable" data-k="elapsed_us" onclick="sortRecent('elapsed_us')">总(s)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="slow" onclick="sortRecent('slow')">慢<span class="sort-ind"></span></th>
+            <th class="sortable" data-k="interval_us" onclick="sortRecent('interval_us')">间隔(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="parse_us" onclick="sortRecent('parse_us')">解析(µs)<span class="sort-ind"></span>
+            </th>
+            <th class="sortable" data-k="setup_us" onclick="sortRecent('setup_us')">后端准备(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="send_us" onclick="sortRecent('send_us')">发送(µs)<span class="sort-ind"></span>
+            </th>
+            <th class="sortable" data-k="forward_us" onclick="sortRecent('forward_us')">后端执行+转发(µs)<span
+                class="sort-ind"></span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="12" class="empty">加载中…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="recent-pager" style="padding:8px 12px;border-top:1px solid var(--border);"></div>
+  </section>
+
+  <section class="panel">
+    <h2>最近慢查询<span id="slow-title">（含阶段耗时，最多 200 条）</span>
+      <span class="actions">
+        <!-- <input id="slow-sql" placeholder="SQL过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;"> -->
+        <input id="slow-db" placeholder="库过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <input id="slow-user" placeholder="用户过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <input id="slow-shard" placeholder="分片过滤…" class="f"
+          style="background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <button style="padding:4px 12px;font-weight:600;" onclick="refreshSlow()">⟳ 刷新</button>
+        <span id="slow-ts" style="color:var(--muted);font-size:11px;"></span>
+        <button class="ghost" style="padding:3px 8px;" onclick="clearSlowFilters()">清除过滤</button>
+        <button id="slow-clear" class="danger" style="padding:3px 8px;">清除</button>
+        <button class="ghost" style="padding:3px 8px;" onclick="exportSlow()">导出</button>
+      </span>
+    </h2>
+    <div class="sql-scroll">
+      <table id="slow-table" class="sql-table">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>SQL</th>
+            <th>库</th>
+            <th>用户</th>
+            <th>分片</th>
+            <th class="sortable" data-k="elapsed_us" onclick="sortSlow('elapsed_us')">总(s)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="interval_us" onclick="sortSlow('interval_us')">间隔(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="parse_us" onclick="sortSlow('parse_us')">解析(µs)<span class="sort-ind"></span>
+            </th>
+            <th class="sortable" data-k="setup_us" onclick="sortSlow('setup_us')">后端准备(µs)<span class="sort-ind"></span>
+            </th>
+            <th class="sortable" data-k="send_us" onclick="sortSlow('send_us')">发送(µs)<span class="sort-ind"></span>
+            </th>
+            <th class="sortable" data-k="forward_us" onclick="sortSlow('forward_us')">后端执行+转发(µs)<span
+                class="sort-ind"></span></th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="11" class="empty">加载中…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="slow-pager" style="padding:8px 12px;border-top:1px solid var(--border);"></div>
+  </section>
+
+  <section class="panel">
+    <h2 id="be-title">后端错误统计（<span id="be-count">0</span> 条，最多 200 条，悬停查看完整 SQL）
+      <span class="actions"><button class="ghost" style="padding:3px 8px;"
+          onclick="refreshBackendErrors()">刷新</button></span>
+    </h2>
+    <div class="sql-scroll">
+      <table id="be-stats-table" class="sql-table">
+        <thead>
+          <tr>
+            <th>错误码</th>
+            <th>次数</th>
+            <th>占比</th>
+            <th>最近时间</th>
+            <th>最近SQL</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="5" class="empty">加载中…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="sql-scroll">
+      <table id="be-table" class="sql-table">
+        <thead>
+          <tr>
+            <th>时间</th>
+            <th>错误码</th>
+            <th>SQL</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="3" class="empty">加载中…</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div id="be-pager" style="padding:8px 12px;border-top:1px solid var(--border);"></div>
+  </section>
+
+  <section class="panel">
+    <h2>后端连接池<span class="sub">（按 分片 × 用户 分桶）</span></h2>
+    <table id="pool-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>分片</th>
+          <th>用户</th>
+          <th>写队列(主)</th>
+          <th>读队列(从)</th>
+          <th>max_size</th>
+          <th>max_serve_times</th>
+          <th>max_idle(s)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td colspan="8" class="empty">加载中…</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>后端节点流量<span class="sub">（按后端 MySQL 节点 接收/发送 B/s，2s 采样 · 最近 10 分钟，实线=接收 虚线=发送）</span></h2>
+    <canvas id="ch-node-traffic" style="width:100%;height:150px;display:block;"></canvas>
+    <div id="node-tooltip"
+      style="position:fixed;display:none;z-index:99;background:rgba(20,26,34,0.95);border:1px solid var(--border);border-radius:6px;padding:6px 10px;font-size:11px;color:var(--text);pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.4);min-width:120px;"></div>
+    <div id="node-legend"
+      style="display:flex;flex-wrap:wrap;gap:4px 16px;padding:6px 12px;font-size:11px;color:var(--muted);border-top:1px solid var(--border);"></div>
+  </section>
+
+  <section class="panel">
+    <h2>配置摘要
+      <span class="actions">
+        <input id="sq-ms" type="number" min="1" placeholder="慢查询阈值(ms)"
+          style="width:130px;background:#0f1419;border:1px solid var(--border);border-radius:5px;color:var(--text);padding:4px 8px;font-size:12px;">
+        <button onclick="saveSlowMs()">设置阈值并生效</button>
+        <button onclick="reloadConfig()">热加载配置(RELOAD)</button>
+      </span>
+    </h2>
+    <table id="cfg-table">
+      <tbody>
+        <tr>
+          <td colspan="2" class="empty">加载中…</td>
+        </tr>
+      </tbody>
+    </table>
+  </section>
+
+  <div id="toast"></div>
+
+  <script>
+    "use strict";
+    // ─── 采样历史(最近 120 点,2s/点 ≈ 4 分钟窗口)───
+    // 采样历史:2s/点,默认窗口 10 分钟(300 点)。
+    // 内存:3 数组 + 时间戳 ≈ 10KB,远小于 10MB 上限
+    // (10MB 理论上可存 ~130 万点/数组 ≈ 30 天@2s,窗口可依需放大)。
+    const hist = { qps: [], conn: [], lat: [], recv: [], send: [], pktrecv: [], pktsend: [], ts: [] };
+    const MAX_POINTS = 300;
+
+    async function jget(path) {
+      const r = await fetch(path, { headers: { "Accept": "application/json" } });
+      if (r.status === 401) { location.href = "/"; throw new Error("未登录"); }
+      if (!r.ok) throw new Error(path + " -> HTTP " + r.status);
+      return r.json();
+    }
+    async function jpost(path) {
+      const r = await fetch(path, { method: "POST" });
+      if (r.status === 401) { location.href = "/"; throw new Error("未登录"); }
+      if (!r.ok) throw new Error(path + " -> HTTP " + r.status);
+      return r.json();
+    }
+
+    function el(tag, cls, text) {
+      const e = document.createElement(tag);
+      if (cls) e.className = cls;
+      if (text !== undefined) e.textContent = text;
+      return e;
+    }
+
+    function fmtBytes(n) {
+      if (n >= 1 << 30) return (n / (1 << 30)).toFixed(2) + " GiB";
+      if (n >= 1 << 20) return (n / (1 << 20)).toFixed(2) + " MiB";
+      if (n >= 1 << 10) return (n / (1 << 10)).toFixed(1) + " KiB";
+      return String(n) + " B";
+    }
+
+    // ─── 状态卡片 ───
+    let prevStatus = null, prevTs = 0;
+    function renderStatus(s) {
+      const cards = document.getElementById("cards");
+      cards.innerHTML = "";
+      const now = Date.now();
+      const qps = prevStatus && prevTs ? Math.round((s.queries_total - prevStatus.queries_total) * 1000 / (now - prevTs)) : 0;
+      // 速率差值必须用"上一次"状态计算(在 prevStatus 更新前取旧值)
+      const recvRate = prevStatus ? Math.round((s.bytes_received - prevStatus.bytes_received) * 1000 / (now - prevTs)) : 0;
+      const sendRate = prevStatus ? Math.round((s.bytes_sent - prevStatus.bytes_sent) * 1000 / (now - prevTs)) : 0;
+      const pktRecv = prevStatus ? Math.round((s.packets_received - prevStatus.packets_received) * 1000 / (now - prevTs)) : 0;
+      const pktSend = prevStatus ? Math.round((s.packets_sent - prevStatus.packets_sent) * 1000 / (now - prevTs)) : 0;
+      prevStatus = s; prevTs = now;
+      const items = [
+        ["活跃连接", s.connections_active, "v"],
+        ["累计连接", s.connections_total, "v"],
+        ["拒绝连接", s.connections_rejected, s.connections_rejected ? "v warn" : "v"],
+        ["累计查询", s.queries_total, "v"],
+        ["QPS", qps, "v"],
+        ["慢查询", s.queries_slow, s.queries_slow ? "v warn" : "v"],
+        ["查询错误", s.queries_errors, s.queries_errors ? "v err" : "v"],
+        ["池获取失败", s.pool_acquire_fails, s.pool_acquire_fails ? "v warn" : "v"],
+        ["分片查询数", (s.shards || []).map(x => x.shard + "=" + x.queries).join(" / ") || "-", "v"],
+        // 进程负载(扩缩容参考;非 Linux 平台显示 -)
+        ["进程CPU%", s.process && s.process.cpu_percent != null ? s.process.cpu_percent.toFixed(1) : "-",
+          s.process && s.process.cpu_percent > 80 ? "v warn" : "v"],
+        ["内存", s.process && s.process.memory_bytes != null ? fmtBytes(s.process.memory_bytes) : "-", "v"],
+        ["FD数", s.process && s.process.fd_count != null ? s.process.fd_count : "-", "v"],
+      ];
+      for (const [k, v, cls] of items) {
+        const c = el("div", "card");
+        c.appendChild(el("div", "k", k));
+        c.appendChild(el("div", cls, v));
+        cards.appendChild(c);
+      }
+      // 趋势
+      // 阶段平均耗时卡片
+      const st = s.stage_avg_us || {};
+      document.getElementById("st-interval").textContent = st.interval ?? "-";
+      document.getElementById("st-parse").textContent = st.parse ?? "-";
+      document.getElementById("st-setup").textContent = st.setup ?? "-";
+      document.getElementById("st-send").textContent = st.send ?? "-";
+      document.getElementById("st-forward").textContent = st.forward ?? "-";
+      hist.ts.push(Date.now());
+      hist.qps.push(qps); hist.conn.push(s.connections_active);
+      hist.lat.push(prevLatAvg || 0);
+      hist.recv.push(recvRate); hist.send.push(sendRate);
+      hist.pktrecv.push(pktRecv); hist.pktsend.push(pktSend);
+      if (hist.qps.length > MAX_POINTS) {
+        hist.ts.shift(); hist.qps.shift(); hist.conn.shift(); hist.lat.shift();
+        hist.recv.shift(); hist.send.shift(); hist.pktrecv.shift(); hist.pktsend.shift();
+      }
+      drawChart("ch-qps", hist.qps, hist.ts, "#4f8cff");
+      drawChart("ch-conn", hist.conn, hist.ts, "#34c759");
+      drawChart("ch-lat", hist.lat, hist.ts, "#ff9500");
+      drawTraffic("ch-traffic", hist.recv, hist.send, hist.ts);
+      drawTraffic("ch-pkts", hist.pktrecv, hist.pktsend, hist.ts);
+      renderShardStages(s.shard_stages);
+      refreshNodeTraffic(s.node_traffic, Date.now());
+    }
+
+    // ─── 分片阶段耗时表(来自 /api/status → shard_stages)───
+    function renderShardStages(list) {
+      const tbody = document.querySelector("#shard-stage-table tbody");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      if (!list || !list.length) {
+        tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无分片耗时数据</td></tr>';
+        return;
+      }
+      for (const x of list) {
+        const a = x.avg_us || {};
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono", x.shard));
+        tr.appendChild(el("td", "mono", x.queries));
+        tr.appendChild(el("td", "mono", a.interval ?? "-"));
+        tr.appendChild(el("td", "mono", a.parse ?? "-"));
+        tr.appendChild(el("td", "mono", a.setup ?? "-"));
+        tr.appendChild(el("td", "mono", a.send ?? "-"));
+        tr.appendChild(el("td", "mono", a.forward ?? "-"));
+        tbody.appendChild(tr);
+      }
+    }
+
+    // ─── Canvas 折线图(手绘,零依赖)───
+    function fmtClock(ms) {
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, "0");
+      return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+    }
+
+    function shortNum(v) {
+      if (v >= 1e6) return (v / 1e6).toFixed(1) + "M";
+      if (v >= 1e3) return (v / 1e3).toFixed(1) + "k";
+      return String(Math.round(v));
+    }
+
+    function drawChart(id, data, ts, color) {
+      const canvas = document.getElementById(id);
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      if (w === 0) return;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+      if (data.length < 2) return;
+
+      // 绘图区:左纵轴 38px,底部横轴 16px
+      const padL = 38, padR = 8, padT = 6, padB = 16;
+      const plotW = w - padL - padR, plotH = h - padT - padB;
+      const max = Math.max(...data, 1) * 1.1;
+      const n = data.length - 1;
+
+      // 纵轴:5 档刻度 + 网格线
+      ctx.font = "10px sans-serif";
+      for (let i = 0; i <= 4; i++) {
+        const v = max * i / 4;
+        const y = padT + plotH * (1 - i / 4);
+        ctx.fillStyle = "#8b98ab";
+        ctx.textAlign = "right";
+        ctx.fillText(shortNum(v), padL - 4, y + 3);
+        ctx.strokeStyle = i === 0 ? "rgba(42,51,66,0.9)" : "rgba(42,51,66,0.4)";
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      }
+
+      // 横轴:5 档时间刻度(取对应采样点时间)+ 网格竖线
+      ctx.textAlign = "center";
+      for (let i = 0; i <= 4; i++) {
+        const idx = Math.round(i / 4 * n);
+        const x = padL + plotW * idx / n;
+        const t = ts[idx] ? fmtClock(ts[idx]) : "";
+        ctx.fillStyle = "#8b98ab";
+        ctx.fillText(t, x, h - 4);
+        ctx.strokeStyle = "rgba(42,51,66,0.4)";
+        ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+      }
+
+      // 数据线
+      ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+      data.forEach((v, i) => {
+        const x = padL + plotW * i / n;
+        const y = padT + plotH * (1 - v / max);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      // 当前值标签
+      ctx.textAlign = "left";
+      ctx.fillStyle = color; ctx.font = "11px sans-serif";
+      ctx.fillText(shortNum(data[data.length - 1]), padL + 2, 12);
+    }
+
+    function drawTraffic(id, recv, send, ts) {
+      const canvas = document.getElementById(id);
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      if (w === 0) return;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+      if (recv.length < 2) return;
+      const padL = 38, padR = 8, padT = 6, padB = 16;
+      const plotW = w - padL - padR, plotH = h - padT - padB;
+      const all = recv.concat(send);
+      const max = Math.max(...all, 1) * 1.1;
+      const n = recv.length - 1;
+      ctx.font = "10px sans-serif";
+      // 纵轴
+      for (let i = 0; i <= 4; i++) {
+        const v = max * i / 4;
+        const y = padT + plotH * (1 - i / 4);
+        ctx.fillStyle = "#8b98ab"; ctx.textAlign = "right";
+        ctx.fillText(shortNum(v), padL - 4, y + 3);
+        ctx.strokeStyle = i === 0 ? "rgba(42,51,66,0.9)" : "rgba(42,51,66,0.4)";
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      }
+      // 横轴
+      ctx.textAlign = "center";
+      for (let i = 0; i <= 4; i++) {
+        const idx = Math.round(i / 4 * n);
+        const x = padL + plotW * idx / n;
+        ctx.fillStyle = "#8b98ab";
+        ctx.fillText(ts[idx] ? fmtClock(ts[idx]) : "", x, h - 4);
+        ctx.strokeStyle = "rgba(42,51,66,0.4)";
+        ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+      }
+      // 双线:接收 / 发送
+      const series = [[recv, "#4f8cff"], [send, "#ff9500"]];
+      for (const [data, color] of series) {
+        ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+        data.forEach((v, i) => {
+          const x = padL + plotW * i / n;
+          const y = padT + plotH * (1 - v / max);
+          i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        });
+        ctx.stroke();
+      }
+      // 当前值标签
+      ctx.textAlign = "left";
+      ctx.fillStyle = "#4f8cff"; ctx.font = "11px sans-serif";
+      ctx.fillText(shortNum(recv[recv.length - 1]), padL + 2, 12);
+      ctx.fillStyle = "#ff9500";
+      ctx.fillText(shortNum(send[send.length - 1]), padL + 70, 12);
+    }
+
+    // ─── 连接表 ───
+    async function refreshConnections() {
+      const tbody = document.querySelector("#conn-table tbody");
+      try {
+        const d = await jget("/api/connections");
+        tbody.innerHTML = "";
+        if (!d.connections.length) {
+          tbody.innerHTML = '<tr><td colspan="8" class="empty">无活跃连接</td></tr>';
+          return;
+        }
+        for (const c of d.connections) {
+          const tr = el("tr");
+          tr.appendChild(el("td", "mono", c.cid));
+          tr.appendChild(el("td", "mono", c.addr));
+          tr.appendChild(el("td", "", c.user || "-"));
+          tr.appendChild(el("td", "", c.db || "-"));
+          tr.appendChild(el("td", "", c.state));
+          tr.appendChild(el("td", "mono", (c.backends || []).join(", ") || "-"));
+          tr.appendChild(el("td", "", c.uptime_secs));
+          const td = el("td");
+          const btn = el("button", "danger", "kill");
+          btn.onclick = () => killConn(c.cid);
+          td.appendChild(btn);
+          tr.appendChild(td);
+          tbody.appendChild(tr);
+        }
+      } catch (e) { tbody.innerHTML = '<tr><td colspan="8" class="empty">' + e.message + "</td></tr>"; }
+    }
+
+    async function killConn(cid) {
+      try {
+        const r = await jpost("/api/kill?cid=" + cid);
+        toast(r.ok ? "已 kill 连接 " + cid : "失败: " + r.error, r.ok);
+        refreshConnections();
+      } catch (e) { toast(e.message, false); }
+    }
+
+    // ─── SQL 表(仅展示前 100 条,每页 10;分片过滤为前端过滤)───
+    let prevLatAvg = 0;
+    let sqlList = [], sqlPage = 1, sqlShardFilter = "";
+    const SQL_PAGE_SIZE = 10;
+    function filteredSqlList() {
+      const f = sqlShardFilter.trim().toLowerCase();
+      return f ? sqlList.filter(s => String(s.shard || "").toLowerCase().includes(f)) : sqlList;
+    }
+    function renderSqlPage() {
+      const tbody = document.querySelector("#sql-table tbody");
+      tbody.innerHTML = "";
+      const rows = filteredSqlList();
+      if (!rows.length) {
+        tbody.innerHTML = '<tr><td colspan="6" class="empty">' +
+          (sqlShardFilter.trim() ? "无匹配 SQL（分片过滤生效中）" : "暂无 SQL 统计") + "</td></tr>";
+        return;
+      }
+      const start = (sqlPage - 1) * SQL_PAGE_SIZE;
+      const page = rows.slice(start, start + SQL_PAGE_SIZE);
+      for (const s of page) {
+        const tr = el("tr");
+        tr.appendChild(el("td", "sql", s.template));
+        tr.appendChild(el("td", "mono", s.shard || "-"));
+        tr.appendChild(el("td", "mono", s.count));
+        tr.appendChild(el("td", "mono", s.avg_us));
+        tr.appendChild(el("td", "mono", s.max_time_us));
+        tr.appendChild(el("td", "mono", s.rows_sent));
+        tbody.appendChild(tr);
+      }
+      updateSqlPager(rows.length);
+    }
+    function updateSqlPager(total) {
+      const elp = document.getElementById("sql-pager");
+      if (!elp) return;
+      const pages = Math.max(1, Math.ceil(total / SQL_PAGE_SIZE));
+      elp.innerHTML =
+        '<button class="ghost" style="padding:2px 8px;" onclick="sqlPage=Math.max(1,sqlPage-1);renderSqlPage()">« 上一页</button> ' +
+        '<span style="color:var(--muted);margin:0 8px;">第 ' + sqlPage + '/' + pages + ' 页 · 共 ' + total + ' 条</span> ' +
+        '<button class="ghost" style="padding:2px 8px;" onclick="sqlPage=Math.min(' + pages + ',sqlPage+1);renderSqlPage()">下一页 »</button>';
+    }
+    async function refreshSql() {
+      const tbody = document.querySelector("#sql-table tbody");
+      try {
+        const d = await jget("/api/sql");
+        sqlList = d.top || [];
+        if (sqlPage > Math.max(1, Math.ceil(sqlList.length / SQL_PAGE_SIZE))) sqlPage = 1;
+        if (!sqlList.length) {
+          tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无 SQL 统计</td></tr>';
+          return;
+        }
+        renderSqlPage();
+        if (sqlList.length) prevLatAvg = sqlList.reduce((a, s) => a + s.avg_us, 0) / sqlList.length;
+      } catch (e) { tbody.innerHTML = '<tr><td colspan="6" class="empty">' + e.message + "</td></tr>"; }
+    }
+
+    // ─── 最近查询表(可按 SQL 过滤,查看单条执行的阶段耗时)───
+    function clearRecentFilters() {
+      ["recent-db", "recent-user", "recent-shard"].forEach(id => document.getElementById(id).value = "");
+      refreshRecent();
+    }
+    function clearSlowFilters() {
+      ["slow-db", "slow-user", "slow-shard"].forEach(id => document.getElementById(id).value = "");
+      refreshSlow();
+    }
+    // ─── 列排序(查询统计 + 慢查询)───
+    let recentSort = { k: "ts", dir: -1 };
+    let slowSort = { k: "ts", dir: -1 };
+    function applySort(list, st) {
+      if (!st || !st.k || !list.length) return list.slice();
+      const rows = list.slice();
+      const k = st.k;
+      rows.sort((a, b) => {
+        let x = a[k], y = b[k];
+        if (x === undefined || x === null) x = "";
+        if (y === undefined || y === null) y = "";
+        if (typeof x === "string") { x = x.toLowerCase(); y = String(y).toLowerCase(); }
+        if (x === y) return 0;
+        return (x < y ? -1 : 1) * st.dir;
+      });
+      return rows;
+    }
+    function sortRecent(k) {
+      if (recentSort.k === k) recentSort.dir = -recentSort.dir;
+      else recentSort = { k: k, dir: 1 };
+      refreshSortInds("recent-table", recentSort);
+      renderRecentPage();
+    }
+    function sortSlow(k) {
+      if (slowSort.k === k) slowSort.dir = -slowSort.dir;
+      else slowSort = { k: k, dir: 1 };
+      refreshSortInds("slow-table", slowSort);
+      renderSlowPage();
+    }
+    function refreshSortInds(tableId, st) {
+      document.querySelectorAll("#" + tableId + " th.sortable").forEach(th => {
+        const ind = th.querySelector(".sort-ind");
+        if (th.dataset.k === st.k) ind.textContent = st.dir > 0 ? " ▲" : " ▼";
+        else ind.textContent = "";
+      });
+    }
+
+    // ─── 最近查询分页(每页 20)───
+    const PAGE_SIZE = 20;
+    let recentList = [], recentPage = 1;
+    function renderRecentPage() {
+      const tbody = document.querySelector("#recent-table tbody");
+      tbody.innerHTML = "";
+      const rows = applySort(recentList, recentSort);
+      const start = (recentPage - 1) * PAGE_SIZE;
+      const page = rows.slice(start, start + PAGE_SIZE);
+      for (const q of page) {
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono", new Date(q.ts * 1000).toLocaleTimeString()));
+        tr.appendChild(el("td", "sql", q.sql));
+        tr.appendChild(el("td", "", q.db || "-"));
+        tr.appendChild(el("td", "", q.puser || "-"));
+        tr.appendChild(el("td", "mono", q.shard || "-"));
+        tr.appendChild(el("td", "mono", (q.elapsed_us / 1e6).toFixed(3)));
+        { // 慢标记:超阈值红●,否则绿●
+          const tdc = el("td");
+          const dc = document.createElement("span");
+          dc.style.color = q.slow ? "var(--err)" : "var(--ok)";
+          dc.textContent = "●";
+          tdc.appendChild(dc);
+          tr.appendChild(tdc);
+        }
+        tr.appendChild(el("td", "mono", q.interval_us));
+        tr.appendChild(el("td", "mono", q.parse_us));
+        tr.appendChild(el("td", "mono", q.setup_us));
+        tr.appendChild(el("td", "mono", q.send_us));
+        tr.appendChild(el("td", "mono", q.forward_us));
+        tbody.appendChild(tr);
+      }
+      updateRecentPager();
+    }
+    function updateRecentPager() {
+      const elp = document.getElementById("recent-pager");
+      if (!elp) return;
+      const pages = Math.max(1, Math.ceil(recentList.length / PAGE_SIZE));
+      elp.innerHTML =
+        '<button class="ghost" style="padding:2px 8px;" onclick="recentPage=Math.max(1,recentPage-1);renderRecentPage()">« 上一页</button> ' +
+        '<span style="color:var(--muted);margin:0 8px;">第 ' + recentPage + '/' + pages + ' 页 · 共 ' + recentList.length + ' 条</span> ' +
+        '<button class="ghost" style="padding:2px 8px;" onclick="recentPage=Math.min(' + pages + ',recentPage+1);renderRecentPage()">下一页 »</button>';
+    }
+    function recentFilters() {
+      const p = new URLSearchParams();
+      const d = document.getElementById("recent-db").value.trim();
+      const u = document.getElementById("recent-user").value.trim();
+      const s = document.getElementById("recent-shard").value.trim();
+      if (d) p.set("db", d); if (u) p.set("user", u); if (s) p.set("shard", s);
+      return p.toString();
+    }
+    async function refreshRecent() {
+      document.getElementById("recent-ts").textContent =
+        "上次 " + new Date().toLocaleTimeString() + " · 3s 自动刷新";
+      const qs = recentFilters();
+      try {
+        const d = await jget("/api/recent" + (qs ? "?" + qs : ""));
+        recentList = d.recent || [];
+        if (recentPage > Math.max(1, Math.ceil(recentList.length / PAGE_SIZE))) recentPage = 1;
+        const tbody = document.querySelector("#recent-table tbody");
+        if (!recentList.length) {
+          tbody.innerHTML = '<tr><td colspan="12" class="empty">' + (qs ? "无匹配查询（过滤条件生效中）— 点右上角「清除过滤」" : "暂无查询") + "</td></tr>";
+        }
+        renderRecentPage();
+      } catch (e) { document.querySelector("#recent-table tbody").innerHTML = '<tr><td colspan="12" class="empty">' + e.message + "</td></tr>"; }
+    }
+
+    // ─── 慢查询分页(每页 20)───
+    let slowList = [], slowPage = 1;
+    function renderSlowPage() {
+      const tbody = document.querySelector("#slow-table tbody");
+      tbody.innerHTML = "";
+      const rows = applySort(slowList, slowSort);
+      const start = (slowPage - 1) * PAGE_SIZE;
+      const page = rows.slice(start, start + PAGE_SIZE);
+      for (const q of page) {
+        const tr = el("tr");
+        const t = new Date(q.ts * 1000);
+        tr.appendChild(el("td", "mono", t.toLocaleTimeString()));
+        tr.appendChild(el("td", "sql", q.sql));
+        tr.appendChild(el("td", "", q.db || "-"));
+        tr.appendChild(el("td", "", q.puser || "-"));
+        tr.appendChild(el("td", "mono", q.shard || "-"));
+        tr.appendChild(el("td", "mono", (q.elapsed_us / 1e6).toFixed(3)));
+        tr.appendChild(el("td", "mono", q.interval_us));
+        tr.appendChild(el("td", "mono", q.parse_us));
+        tr.appendChild(el("td", "mono", q.setup_us));
+        tr.appendChild(el("td", "mono", q.send_us));
+        tr.appendChild(el("td", "mono", q.forward_us));
+        tbody.appendChild(tr);
+      }
+      updateSlowPager();
+    }
+    function updateSlowPager() {
+      const elp = document.getElementById("slow-pager");
+      if (!elp) return;
+      const pages = Math.max(1, Math.ceil(slowList.length / PAGE_SIZE));
+      elp.innerHTML =
+        '<button class="ghost" style="padding:2px 8px;" onclick="slowPage=Math.max(1,slowPage-1);renderSlowPage()">« 上一页</button> ' +
+        '<span style="color:var(--muted);margin:0 8px;">第 ' + slowPage + '/' + pages + ' 页 · 共 ' + slowList.length + ' 条</span> ' +
+        '<button class="ghost" style="padding:2px 8px;" onclick="slowPage=Math.min(' + pages + ',slowPage+1);renderSlowPage()">下一页 »</button>';
+    }
+
+    // ─── 慢查询表 ───
+    function slowFilters() {
+      const p = new URLSearchParams();
+      const d = document.getElementById("slow-db").value.trim();
+      const u = document.getElementById("slow-user").value.trim();
+      const s = document.getElementById("slow-shard").value.trim();
+      if (d) p.set("db", d); if (u) p.set("user", u); if (s) p.set("shard", s);
+      return p.toString();
+    }
+    async function refreshSlow() {
+      const tsEl = document.getElementById("slow-ts");
+      if (tsEl) tsEl.textContent =
+        "上次 " + new Date().toLocaleTimeString() + " · 2s 自动刷新";
+      const qs = slowFilters();
+      try {
+        const d = await jget("/api/slow" + (qs ? "?" + qs : ""));
+        slowList = d.slow || [];
+        if (slowPage > Math.max(1, Math.ceil(slowList.length / PAGE_SIZE))) slowPage = 1;
+        if (!slowList.length) {
+          document.querySelector("#slow-table tbody").innerHTML = '<tr><td colspan="11" class="empty">' + (qs ? "无匹配慢查询（过滤条件生效中）— 点右上角「清除过滤」" : "暂无慢查询") + "</td></tr>";
+          return;
+        }
+        renderSlowPage();
+      } catch (e) { document.querySelector("#slow-table tbody").innerHTML = '<tr><td colspan="11" class="empty">' + e.message + "</td></tr>"; }
+    }
+    async function clearSlow() {
+      try {
+        const r = await jpost("/api/slow/clear");
+        toast(r.ok ? "已清空慢查询" : "清除失败: " + (r.error || ""), r.ok);
+        refreshSlow();
+      } catch (e) { toast(e.message, false); }
+    }
+    async function clearRecent() {
+      try {
+        const r = await jpost("/api/recent/clear");
+        toast(r.ok ? "已清空查询统计" : "清除失败: " + (r.error || ""), r.ok);
+        refreshRecent();
+      } catch (e) { toast(e.message, false); }
+    }
+
+    // ─── 导出 CSV(导出当前已加载数据,尊重过滤与排序;UTF-8 BOM 便于 Excel 打开)───
+    function csvCell(v) {
+      const s = v === undefined || v === null ? "" : String(v);
+      return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    function fmtDt(ts) {
+      const d = new Date(ts * 1000), p = n => String(n).padStart(2, "0");
+      return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+        " " + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+    }
+    function dateStamp() {
+      const d = new Date(), p = n => String(n).padStart(2, "0");
+      return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + "-" +
+        p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+    }
+    function exportCsv(filename, headers, rows) {
+      if (!rows.length) { toast("无数据可导出", false); return; }
+      const lines = [headers.map(csvCell).join(",")];
+      for (const r of rows) lines.push(r.map(csvCell).join(","));
+      const blob = new Blob(["\uFEFF" + lines.join("\r\n")], { type: "text/csv;charset=utf-8;" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      toast("已导出 " + rows.length + " 条 → " + filename, true);
+    }
+    function exportSql() {
+      const rows = filteredSqlList().map(s => [s.template, s.shard || "", s.count, s.avg_us, s.max_time_us, s.rows_sent]);
+      exportCsv("top-sql-" + dateStamp() + ".csv",
+        ["SQL模板", "分片", "次数", "平均(µs)", "最大(µs)", "行数"], rows);
+    }
+    function exportRecent() {
+      const rows = applySort(recentList, recentSort).map(q => [
+        fmtDt(q.ts), q.sql, q.db || "", q.puser || "", q.shard || "",
+        (q.elapsed_us / 1e6).toFixed(3), q.slow ? "是" : "否",
+        q.interval_us, q.parse_us, q.setup_us, q.send_us, q.forward_us]);
+      exportCsv("queries-" + dateStamp() + ".csv",
+        ["时间", "SQL", "库", "用户", "分片", "总耗时(s)", "慢",
+         "间隔(µs)", "解析(µs)", "后端准备(µs)", "发送(µs)", "后端执行+转发(µs)"], rows);
+    }
+    function exportSlow() {
+      const rows = applySort(slowList, slowSort).map(q => [
+        fmtDt(q.ts), q.sql, q.db || "", q.puser || "", q.shard || "",
+        (q.elapsed_us / 1e6).toFixed(3),
+        q.interval_us, q.parse_us, q.setup_us, q.send_us, q.forward_us]);
+      exportCsv("slow-" + dateStamp() + ".csv",
+        ["时间", "SQL", "库", "用户", "分片", "总耗时(s)",
+         "间隔(µs)", "解析(µs)", "后端准备(µs)", "发送(µs)", "后端执行+转发(µs)"], rows);
+    }
+
+    // ─── 后端错误统计表(按错误码聚合 + 最近明细,悬停 title 显示完整 SQL)───
+    async function refreshBackendErrors() {
+      try {
+        const d = await jget("/api/backenderrors");
+        document.getElementById("be-count").textContent = d.total ?? 0;
+        // 按错误码聚合
+        const st = document.querySelector("#be-stats-table tbody");
+        st.innerHTML = "";
+        const stats = d.stats || [];
+        if (!stats.length) {
+          st.innerHTML = '<tr><td colspan="5" class="empty">暂无后端错误</td></tr>';
+        } else {
+          for (const s of stats) {
+            const tr = el("tr");
+            tr.appendChild(el("td", "mono", s.code));
+            tr.appendChild(el("td", "mono", s.count));
+            tr.appendChild(el("td", "mono", d.total ? (100 * s.count / d.total).toFixed(1) + "%" : "-"));
+            tr.appendChild(el("td", "mono", new Date(s.last_ts * 1000).toLocaleTimeString()));
+            const td = el("td", "sql", s.last_sql);
+            td.title = s.last_sql;
+            tr.appendChild(td);
+            st.appendChild(tr);
+          }
+        }
+        // 最近明细(分页)
+        beList = d.recent || [];
+        if (bePage > Math.max(1, Math.ceil(beList.length / PAGE_SIZE))) bePage = 1;
+        renderBePage();
+      } catch (e) { document.querySelector("#be-table tbody").innerHTML = '<tr><td colspan="3" class="empty">' + e.message + "</td></tr>"; }
+    }
+
+    // ─── 后端错误明细分页(每页 20,与慢查询同款)───
+    let beList = [], bePage = 1;
+    function renderBePage() {
+      const tb = document.querySelector("#be-table tbody");
+      tb.innerHTML = "";
+      if (!beList.length) {
+        tb.innerHTML = '<tr><td colspan="3" class="empty">暂无后端错误</td></tr>';
+        updateBePager();
+        return;
+      }
+      const start = (bePage - 1) * PAGE_SIZE;
+      const page = beList.slice(start, start + PAGE_SIZE);
+      for (const f of page) {
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono", new Date(f.ts * 1000).toLocaleTimeString()));
+        tr.appendChild(el("td", "mono", f.code));
+        const td = el("td", "sql", f.sql);
+        td.title = f.sql;
+        tr.appendChild(td);
+        tb.appendChild(tr);
+      }
+      updateBePager();
+    }
+    function updateBePager() {
+      const elp = document.getElementById("be-pager");
+      if (!elp) return;
+      const pages = Math.max(1, Math.ceil(beList.length / PAGE_SIZE));
+      elp.innerHTML =
+        '<button class="ghost" style="padding:2px 8px;" onclick="bePage=Math.max(1,bePage-1);renderBePage()">« 上一页</button> ' +
+        '<span style="color:var(--muted);margin:0 8px;">第 ' + bePage + '/' + pages + ' 页 · 共 ' + beList.length + ' 条</span> ' +
+        '<button class="ghost" style="padding:2px 8px;" onclick="bePage=Math.min(' + pages + ',bePage+1);renderBePage()">下一页 »</button>';
+    }
+
+    // ─── 池表(按 分片 × 用户 分桶)───
+    async function refreshPool() {
+      const tbody = document.querySelector("#pool-table tbody");
+      try {
+        const d = await jget("/api/pool");
+        tbody.innerHTML = "";
+        const bs = d.buckets || [];
+        if (!bs.length) { tbody.innerHTML = '<tr><td colspan="8" class="empty">池为空(尚无后端连接)</td></tr>'; return; }
+        bs.forEach((b, i) => {
+          const tr = el("tr");
+          tr.appendChild(el("td", "mono", i));
+          tr.appendChild(el("td", "mono", b.shard || "-"));
+          tr.appendChild(el("td", "mono", b.user || "-"));
+          tr.appendChild(el("td", "mono", b.write_queue));
+          tr.appendChild(el("td", "mono", b.read_queue));
+          tr.appendChild(el("td", "mono", b.max_size));
+          tr.appendChild(el("td", "mono", b.max_serve_times));
+          tr.appendChild(el("td", "mono", b.max_idle_secs));
+          tbody.appendChild(tr);
+        });
+      } catch (e) { tbody.innerHTML = '<tr><td colspan="8" class="empty">' + e.message + "</td></tr>"; }
+    }
+
+    // ─── 后端节点流量图(按后端 MySQL 节点 接收/发送 B/s,2s 采样)───
+    const NODE_COLORS = ["#4f8cff", "#ff9500", "#34c759", "#ff3b30", "#af52de", "#ffcc00", "#5ac8fa", "#ff2d55", "#00c7be", "#ff7f2a"];
+    const nodePrev = {};   // 节点 → {recv, sent} 上次累计值
+    const nodeHist = {};   // 节点 → {recv: [B/s], sent: [B/s]}
+    const nodeOrder = [];  // 节点显示顺序(按首次出现)
+    const nodeTs = [];     // 采样时间戳
+    let nodeHoverIdx = null; // 鼠标悬停的采样点索引(节点流量图 tooltip)
+    function refreshNodeTraffic(nodes, ts) {
+      if (!nodes || !nodes.length) return;
+      nodeTs.push(ts);
+      if (nodeTs.length > MAX_POINTS) nodeTs.shift();
+      for (const n of nodes) {
+        if (!nodeHist[n.node]) {
+          nodeHist[n.node] = { recv: [], sent: [] };
+          nodeOrder.push(n.node);
+        }
+        const prev = nodePrev[n.node];
+        const dt = nodeTs.length >= 2 ? (nodeTs[nodeTs.length - 1] - nodeTs[nodeTs.length - 2]) / 1000 : 1;
+        const recvRate = prev ? Math.max(0, (n.recv_bytes - prev.recv) / dt) : 0;
+        const sentRate = prev ? Math.max(0, (n.sent_bytes - prev.sent) / dt) : 0;
+        nodePrev[n.node] = { recv: n.recv_bytes, sent: n.sent_bytes };
+        nodeHist[n.node].recv.push(recvRate);
+        nodeHist[n.node].sent.push(sentRate);
+      }
+      // 对齐时间轴:本期未上报的节点补 0(节点消失则曲线走平)
+      for (const name of nodeOrder) {
+        while (nodeHist[name].recv.length < nodeTs.length) { nodeHist[name].recv.push(0); nodeHist[name].sent.push(0); }
+        if (nodeHist[name].recv.length > MAX_POINTS) { nodeHist[name].recv.shift(); nodeHist[name].sent.shift(); }
+      }
+      drawNodeTraffic();
+    }
+    function drawNodeTraffic() {
+      const canvas = document.getElementById("ch-node-traffic");
+      const legend = document.getElementById("node-legend");
+      if (!canvas || !legend) return;
+      const dpr = window.devicePixelRatio || 1;
+      const w = canvas.clientWidth, h = canvas.clientHeight;
+      if (w === 0) return;
+      canvas.width = w * dpr; canvas.height = h * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.clearRect(0, 0, w, h);
+      // 图例:节点色块 + 当前 收/发 速率
+      legend.innerHTML = "";
+      for (const name of nodeOrder) {
+        const color = NODE_COLORS[nodeOrder.indexOf(name) % NODE_COLORS.length];
+        const cur = nodeHist[name];
+        const lastR = cur ? cur.recv[cur.recv.length - 1] || 0 : 0;
+        const lastS = cur ? cur.sent[cur.sent.length - 1] || 0 : 0;
+        const item = document.createElement("span");
+        item.style.display = "inline-flex"; item.style.alignItems = "center"; item.style.gap = "4px";
+        item.innerHTML = '<span style="width:9px;height:9px;border-radius:2px;background:' + color + ';display:inline-block;"></span>' +
+          name + ' <b style="color:var(--text);">收 ' + shortNum(lastR) + '</b> 发 ' + shortNum(lastS);
+        legend.appendChild(item);
+      }
+      if (nodeTs.length < 2) return;
+      const padL = 38, padR = 8, padT = 6, padB = 16;
+      const plotW = w - padL - padR, plotH = h - padT - padB;
+      let max = 1;
+      for (const name of nodeOrder) {
+        const cur = nodeHist[name];
+        if (!cur) continue;
+        for (const v of cur.recv.concat(cur.sent)) if (v > max) max = v;
+      }
+      max *= 1.1;
+      const n = nodeTs.length - 1;
+      ctx.font = "10px sans-serif";
+      // 纵轴
+      for (let i = 0; i <= 4; i++) {
+        const v = max * i / 4;
+        const y = padT + plotH * (1 - i / 4);
+        ctx.fillStyle = "#8b98ab"; ctx.textAlign = "right";
+        ctx.fillText(shortNum(v), padL - 4, y + 3);
+        ctx.strokeStyle = i === 0 ? "rgba(42,51,66,0.9)" : "rgba(42,51,66,0.4)";
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(w - padR, y); ctx.stroke();
+      }
+      // 横轴
+      ctx.textAlign = "center";
+      for (let i = 0; i <= 4; i++) {
+        const idx = Math.round(i / 4 * n);
+        const x = padL + plotW * idx / n;
+        ctx.fillStyle = "#8b98ab";
+        ctx.fillText(nodeTs[idx] ? fmtClock(nodeTs[idx]) : "", x, h - 4);
+        ctx.strokeStyle = "rgba(42,51,66,0.4)";
+        ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+      }
+      // 每节点两条线:接收实线 / 发送虚线(同色)
+      for (const name of nodeOrder) {
+        const cur = nodeHist[name];
+        if (!cur) continue;
+        const color = NODE_COLORS[nodeOrder.indexOf(name) % NODE_COLORS.length];
+        for (const [data, dash] of [[cur.recv, []], [cur.sent, [4, 3]]]) {
+          ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.setLineDash(dash); ctx.beginPath();
+          data.forEach((v, i) => {
+            const x = padL + plotW * i / n;
+            const y = padT + plotH * (1 - v / max);
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          });
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+      }
+      // hover 参考线(鼠标悬停的采样点)
+      if (nodeHoverIdx != null && nodeHoverIdx >= 0 && nodeHoverIdx <= n) {
+        const x = padL + plotW * nodeHoverIdx / n;
+        ctx.strokeStyle = "rgba(255,255,255,0.35)";
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // ─── 节点流量图 hover:定位采样点并显示各节点收/发数值 tooltip ───
+    function attachNodeTrafficHover() {
+      const canvas = document.getElementById("ch-node-traffic");
+      if (!canvas) return;
+      canvas.addEventListener("mousemove", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const mx = e.clientX - rect.left;
+        const padL = 38, padR = 8;
+        const plotW = canvas.clientWidth - padL - padR;
+        const n = nodeTs.length - 1;
+        if (n < 1 || plotW <= 0) return;
+        const idx = Math.max(0, Math.min(n, Math.round((mx - padL) / plotW * n)));
+        nodeHoverIdx = idx;
+        drawNodeTraffic();
+        const tip = document.getElementById("node-tooltip");
+        if (!tip) return;
+        const get = (arr, i) => (arr && arr[i] !== undefined ? arr[i] : 0);
+        let html = "<div style='font-weight:600;margin-bottom:3px;'>" + fmtClock(nodeTs[idx]) + "</div>";
+        for (const name of nodeOrder) {
+          const cur = nodeHist[name];
+          if (!cur) continue;
+          const color = NODE_COLORS[nodeOrder.indexOf(name) % NODE_COLORS.length];
+          html += "<div style='display:flex;justify-content:space-between;gap:12px;'>" +
+            "<span><i style='background:" + color + ";width:8px;height:8px;border-radius:2px;display:inline-block;margin-right:5px;'></i>" + name + "</span>" +
+            "<span>收 <b>" + shortNum(get(cur.recv, idx)) + "</b> · 发 <b>" + shortNum(get(cur.sent, idx)) + "</b></span></div>";
+        }
+        tip.innerHTML = html;
+        tip.style.display = "block";
+        const tw = tip.offsetWidth, th = tip.offsetHeight;
+        let tx = e.clientX + 14, ty = e.clientY - th - 10;
+        if (tx + tw > window.innerWidth) tx = e.clientX - tw - 14;
+        if (ty < 4) ty = e.clientY + 16;
+        tip.style.left = tx + "px";
+        tip.style.top = ty + "px";
+      });
+      canvas.addEventListener("mouseleave", () => {
+        nodeHoverIdx = null;
+        const tip = document.getElementById("node-tooltip");
+        if (tip) tip.style.display = "none";
+        drawNodeTraffic();
+      });
+    }
+
+    // ─── 配置摘要 ───
+    async function refreshConfig() {
+      const tbody = document.querySelector("#cfg-table tbody");
+      try {
+        const c = await jget("/api/config");
+        tbody.innerHTML = "";
+        document.getElementById("version").textContent = "v" + c.server_version;
+        const rows = [
+          ["业务端口", c.port], ["管理端口", c.mng_port], ["日志目录", c.log_dir],
+          ["日志级别", c.log_level], ["集群数", c.clusters], ["分片数", c.tablets ?? 0],
+          ["后端用户数", c.db_users],
+          ["业务用户数", c.product_users],
+          ["计划绑定", (c.plan_bindings || []).length + " 条"],
+        ];
+        for (const [k, v] of rows) {
+          const tr = el("tr");
+          tr.appendChild(el("td", "k", k));
+          tr.appendChild(el("td", "", v));
+          tbody.appendChild(tr);
+        }
+        // 慢查询标题显示当前阈值(只更新 h2 内文本 span,不覆盖按钮/过滤区)
+        document.getElementById("slow-title").textContent =
+          "（> " + (c.slow_query_ms ?? 200) + "ms，最多 200 条）";
+      } catch (e) { tbody.innerHTML = '<tr><td colspan="2" class="empty">' + e.message + "</td></tr>"; }
+    }
+
+    async function reloadConfig() {
+      try {
+        const r = await jpost("/api/reload");
+        toast(r.ok ? "RELOAD OK: " + (r.diff || "").split("\n")[0] : "RELOAD 失败: " + r.error, r.ok);
+        refreshConfig();
+      } catch (e) { toast(e.message, false); }
+    }
+
+    // ─── 一键健康检测 ───
+    async function runHealthCheck() {
+      const box = document.getElementById("check-result");
+      const btn = document.getElementById("check-btn");
+      btn.disabled = true; btn.textContent = "检测中…";
+      box.style.display = "block";
+      box.innerHTML = '<span style="color:var(--muted)">正在检测(配置/后端/连接池)…</span>';
+      try {
+        const r = await fetch("/api/check", { method: "GET" });
+        if (r.status === 401) { location.href = "/"; return; }
+        const d = await r.json();
+        let html = '<div style="font-weight:600;margin-bottom:8px;">检测结果: ' +
+          (d.overall === "ok" ? '<span style="color:var(--ok)">正常 ✓</span>' : '<span style="color:var(--err)">异常 ✗</span>') + '</div>';
+        for (const c of d.checks || []) {
+          html += '<div style="margin:3px 0;">' + (c.ok ? '✓' : '✗') + ' <b>' + c.name + '</b>: ' +
+            '<span style="color:var(--muted)">' + (c.detail || "") + "</span></div>";
+        }
+        html += "<div style='margin-top:8px;'><button class='ghost' onclick=\"document.getElementById('check-result').style.display='none'\">关闭</button></div>";
+        box.innerHTML = html;
+      } catch (e) { box.innerHTML = '<span style="color:var(--err)">检测失败: ' + e.message + "</span>"; }
+      btn.disabled = false; btn.textContent = "一键检测";
+    }
+
+    // ─── 慢查询阈值设置并一键生效 ───
+    async function saveSlowMs() {
+      const v = document.getElementById("sq-ms").value.trim();
+      if (!v || !/^\d+$/.test(v)) { toast("请输入有效毫秒数", false); return; }
+      try {
+        const r = await fetch("/api/config/slow_query_ms?value=" + encodeURIComponent(v), { method: "POST" });
+        if (r.status === 401) { location.href = "/"; return; }
+        const d = await r.json();
+        if (d.ok) {
+          toast("慢查询阈值已设为 " + d.slow_query_ms + "ms 并生效", true);
+          document.getElementById("sq-ms").value = "";
+          refreshConfig(); refreshSlow();
+        } else { toast("设置失败: " + (d.error || ""), false); }
+      } catch (e) { toast(e.message, false); }
+    }
+
+    function toast(msg, ok) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.style.borderColor = ok ? "var(--ok)" : "var(--err)";
+      t.style.display = "block";
+      clearTimeout(t._h);
+      t._h = setTimeout(() => { t.style.display = "none"; }, 4000);
+    }
+
+    // ─── 主循环:2s 轮询 ───
+    async function tick() {
+      const st = document.getElementById("conn-status");
+      try {
+        const s = await jget("/api/status");
+        renderStatus(s);
+        st.textContent = "已连接 " + new Date().toLocaleTimeString();
+        st.className = "status ok";
+      } catch (e) {
+        st.textContent = e.message;
+        st.className = "status";
+      }
+    }
+    attachNodeTrafficHover();
+    refreshConnections(); refreshSql(); refreshRecent(); refreshSlow(); refreshBackendErrors(); refreshPool(); refreshConfig();
+    let _ft = null, _fs = null, _ftop = null;
+    document.getElementById("recent-db").addEventListener("input", () => { clearTimeout(_ft); _ft = setTimeout(() => { recentPage = 1; refreshRecent(); }, 800); });
+    document.getElementById("recent-user").addEventListener("input", () => { clearTimeout(_ft); _ft = setTimeout(() => { recentPage = 1; refreshRecent(); }, 800); });
+    document.getElementById("recent-shard").addEventListener("input", () => { clearTimeout(_ft); _ft = setTimeout(() => { recentPage = 1; refreshRecent(); }, 800); });
+    document.getElementById("slow-db").addEventListener("input", () => { clearTimeout(_fs); _fs = setTimeout(() => { slowPage = 1; refreshSlow(); }, 800); });
+    document.getElementById("slow-user").addEventListener("input", () => { clearTimeout(_fs); _fs = setTimeout(() => { slowPage = 1; refreshSlow(); }, 800); });
+    document.getElementById("slow-shard").addEventListener("input", () => { clearTimeout(_fs); _fs = setTimeout(() => { slowPage = 1; refreshSlow(); }, 800); });
+    document.getElementById("sql-shard").addEventListener("input", () => { clearTimeout(_ftop); _ftop = setTimeout(() => { sqlPage = 1; renderSqlPage(); }, 800); });
+    document.getElementById("slow-clear").addEventListener("click", clearSlow);
+    document.getElementById("recent-clear").addEventListener("click", clearRecent);
+    tick();
+    setInterval(tick, 2000);
+    setInterval(refreshConnections, 2000);
+    setInterval(refreshSql, 5000);
+    setInterval(refreshRecent, 3000);
+    setInterval(refreshSlow, 2000);   // 慢查询自动刷新(与状态/连接同频)
+    setInterval(refreshBackendErrors, 5000);
+    setInterval(refreshPool, 5000);
+    window.addEventListener("resize", () => { drawChart("ch-qps", hist.qps, hist.ts, "#4f8cff"); drawChart("ch-conn", hist.conn, hist.ts, "#34c759"); drawChart("ch-lat", hist.lat, hist.ts, "#ff9500"); drawTraffic("ch-traffic", hist.recv, hist.send, hist.ts); drawTraffic("ch-pkts", hist.pktrecv, hist.pktsend, hist.ts); drawNodeTraffic(); });
+  </script>
+</body>
+
+</html>

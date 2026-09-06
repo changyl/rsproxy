@@ -1,0 +1,110 @@
+# NewProxy 2 分片测试场景 — 5 容器独立环境
+#
+# 注意:与单分片场景(tests/perf/docker-compose.yml)同目录,必须用独立的
+# 项目名(name: perf-2shard),否则两个 compose 的同名服务(newproxy/sysbench)
+# 会在同一 project 下互相覆盖、重建,导致对方容器被删除。
+#
+# 架构:
+#   mysql-shard0  ← 分片 0(sbtest1 表 5 行,宿主机暴露 3308)
+#   mysql-shard1  ← 分片 1(sbtest1 表 7 行,宿主机暴露 3309)
+#   newproxy-2shard ← 代理(2 tablet: t0→shard0, t1→shard1,rrule hash_mod)
+#                     宿主机暴露 4052(MySQL 协议)/ 9112(管理面板)
+#   sysbench2     ← sysbench 压测工具(连接 newproxy-2shard)
+#
+# 与单分片场景(tests/perf/docker-compose.yml)并存,容器名/端口均不冲突。
+#
+# 启动: docker compose -f tests/perf/docker-compose-2shard.yml up -d --build
+# 验证分片数据: mysql -h127.0.0.1 -P3308 -uroot -ptest_password -e "select count(*) from sbtest.sbtest1"  # 5
+#              mysql -h127.0.0.1 -P3309 -uroot -ptest_password -e "select count(*) from sbtest.sbtest1"  # 7
+# 经代理查询(当前走第一个分片 t0): mysql -h127.0.0.1 -P4052 -uroot -ptest_password -e "select count(*) from sbtest.sbtest1"
+# 面板: http://127.0.0.1:9112 (admin/admin),登录后看 /api/status 的 clusters/tablets
+# 停止: docker compose -f tests/perf/docker-compose-2shard.yml down
+
+name: perf-2shard
+
+services:
+  # ─── 分片 0 ───
+  mysql-shard0:
+    image: mysql:8.0
+    container_name: newproxy-perf-2shard-mysql0
+    environment:
+      MYSQL_ROOT_PASSWORD: test_password
+      MYSQL_DATABASE: sbtest
+    ports:
+      - "3308:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-connections=1000
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    volumes:
+      - ./init_2shard_shard0.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # ─── 分片 1 ───
+  mysql-shard1:
+    image: mysql:8.0
+    container_name: newproxy-perf-2shard-mysql1
+    environment:
+      MYSQL_ROOT_PASSWORD: test_password
+      MYSQL_DATABASE: sbtest
+    ports:
+      - "3309:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-connections=1000
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    volumes:
+      - ./init_2shard_shard1.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # ─── NewProxy 代理(2 分片)───
+  newproxy:
+    build:
+      context: ../..
+      dockerfile: tests/perf/Dockerfile
+      args:
+        # 基础镜像源:默认镜像加速器(直连 Docker Hub 在本机超时);
+        # 直连环境用环境变量覆盖: BASE_RUST=rust:1-bookworm BASE_DEBIAN=debian:bookworm-slim
+        BASE_RUST: ${BASE_RUST:-docker.m.daocloud.io/library/rust:1-bookworm}
+        BASE_DEBIAN: ${BASE_DEBIAN:-docker.m.daocloud.io/library/debian:bookworm-slim}
+    container_name: newproxy-perf-2shard
+    ports:
+      - "4052:4051"
+      - "9112:9111"   # 管理面板/API/Prometheus
+    depends_on:
+      mysql-shard0:
+        condition: service_healthy
+      mysql-shard1:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      # 配置以读写方式挂载:面板可改 slow_query_ms 等阈值并写回配置(测试慢查询阈值用);
+      # 容器内修改会同步写回宿主机 tests/perf/newproxy-2shard-docker.conf
+      - ./newproxy-2shard-docker.conf:/app/conf/newproxy.conf:rw
+
+  # ─── sysbench(可选压测)───
+  sysbench:
+    build:
+      context: .
+      dockerfile: sysbench.Dockerfile
+      args:
+        BASE_DEBIAN: ${BASE_DEBIAN:-docker.m.daocloud.io/library/debian:bookworm-slim}
+    image: perf-sysbench
+    container_name: newproxy-perf-2shard-sysbench
+    depends_on:
+      - mysql-shard0
+      - mysql-shard1
+      - newproxy
+    entrypoint: ["sleep", "infinity"]

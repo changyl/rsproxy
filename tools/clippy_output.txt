@@ -1,0 +1,228 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Checking tribble v5.0.1 (/path/to/rsproxy)
+error: method `connect_backend_by_tablet` is never used
+   --> src/conn/front.rs:297:14
+    |
+ 63 | impl FrontConn {
+    | -------------- method in this implementation
+...
+297 |     async fn connect_backend_by_tablet(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `-D dead-code` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[expect(dead_code)]` or `#[allow(dead_code)]`
+
+error: unneeded `return` statement
+   --> src/conn/front.rs:293:9
+    |
+293 |         return Ok(());
+    |         ^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_return
+    = note: `-D clippy::needless-return` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_return)]`
+help: remove `return`
+    |
+293 -         return Ok(());
+293 +         Ok(())
+    |
+
+error: length comparison to one
+   --> src/conn/front.rs:286:27
+    |
+286 |             let is_done = pkt.len() >= 1 && (pkt[0] == 0x00 || pkt[0] == 0xFF);
+    |                           ^^^^^^^^^^^^^^ help: using `!is_empty` is clearer and more explicit: `!pkt.is_empty()`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#len_zero
+    = note: `-D clippy::len-zero` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::len_zero)]`
+
+error: casting to the same type is unnecessary (`u64` -> `u64`)
+  --> src/limit.rs:62:27
+   |
+62 |         let new_tokens = (elapsed as u64 * self.rate) / 1_000_000;
+   |                           ^^^^^^^^^^^^^^ help: try: `elapsed`
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+   = note: `-D clippy::unnecessary-cast` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::unnecessary_cast)]`
+
+error: the following explicit lifetimes could be elided: 'a
+   --> src/limit.rs:104:26
+    |
+104 |     pub fn allowed_users<'a>(config: &'a AppConfig, ip: Ipv4Addr) -> Option<&'a [String]> {
+    |                          ^^           ^^                                     ^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_lifetimes
+    = note: `-D clippy::needless-lifetimes` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_lifetimes)]`
+help: elide the lifetimes
+    |
+104 -     pub fn allowed_users<'a>(config: &'a AppConfig, ip: Ipv4Addr) -> Option<&'a [String]> {
+104 +     pub fn allowed_users(config: &AppConfig, ip: Ipv4Addr) -> Option<&[String]> {
+    |
+
+error: redundant guard
+   --> src/limit.rs:124:28
+    |
+124 |             Some(users) if users.is_empty() => true, // 空列表:允许所有人
+    |                            ^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#redundant_guards
+    = note: `-D clippy::redundant-guards` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::redundant_guards)]`
+help: try
+    |
+124 -             Some(users) if users.is_empty() => true, // 空列表:允许所有人
+124 +             Some([]) => true, // 空列表:允许所有人
+    |
+
+error: you should consider adding a `Default` implementation for `Metrics`
+  --> src/metric.rs:76:5
+   |
+76 | /     pub fn new() -> Self {
+77 | |         Self {
+78 | |             connections_total: Counter::default(),
+79 | |             connections_active: Counter::default(),
+...  |
+90 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#new_without_default
+   = note: `-D clippy::new-without-default` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::new_without_default)]`
+help: try adding this
+   |
+75 + impl Default for Metrics {
+76 +     fn default() -> Self {
+77 +         Self::new()
+78 +     }
+79 + }
+   |
+
+error: consider using `sort_by_key`
+   --> src/metric.rs:132:9
+    |
+132 |         stats.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_sort_by
+    = note: `-D clippy::unnecessary-sort-by` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_sort_by)]`
+help: try
+    |
+132 -         stats.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+132 +         stats.sort_by_key(|b| std::cmp::Reverse(b.1.count));
+    |
+
+error: manual checked division
+   --> src/mgmt.rs:104:28
+    |
+104 |                         if stat.count > 0 {
+    |                            ^^^^^^^^^^^^^^ check performed here
+105 |                             stat.total_time_us / stat.count
+    |                             ------------------------------- division performed here
+    |
+    = help: consider using `checked_div`
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_checked_ops
+    = note: `-D clippy::manual-checked-ops` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_checked_ops)]`
+
+error: this manual char comparison can be written more succinctly
+   --> src/parser/classify.rs:109:16
+    |
+109 |         .split(|c: char| c == ' ' || c == ',' || c == '\n' || c == '\t')
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: consider using an array of `char`: `[' ', ',', '\n', '\t']`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_pattern_char_comparison
+    = note: `-D clippy::manual-pattern-char-comparison` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_pattern_char_comparison)]`
+
+error: stripping a prefix manually
+   --> src/parser/classify.rs:150:9
+    |
+150 |         &upper[7..] // 跳过 "UPDATE "
+    |         ^^^^^^^^^^^
+    |
+note: the prefix was tested here
+   --> src/parser/classify.rs:149:16
+    |
+149 |     let rest = if upper.starts_with("UPDATE ") {
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#manual_strip
+    = note: `-D clippy::manual-strip` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::manual_strip)]`
+help: try using the `strip_prefix` method
+    |
+149 ~     let rest = if let Some(<stripped>) = upper.strip_prefix("UPDATE ") {
+150 ~         <stripped> // 跳过 "UPDATE "
+    |
+
+error: casting to the same type is unnecessary (`u64` -> `u64`)
+   --> src/pool/backend.rs:175:22
+    |
+175 |         now - last > (self.cfg.max_idle_secs as u64) * 1_000_000
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try: `self.cfg.max_idle_secs`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#unnecessary_cast
+
+error: you should consider adding a `Default` implementation for `SrvPool`
+   --> src/pool/backend.rs:195:5
+    |
+195 | /     pub fn new() -> Self {
+196 | |         Self {
+197 | |             map: DashMap::new(),
+198 | |         }
+199 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#new_without_default
+help: try adding this
+    |
+194 + impl Default for SrvPool {
+195 +     fn default() -> Self {
+196 +         Self::new()
+197 +     }
+198 + }
+    |
+
+error: the borrowed expression implements the required traits
+   --> src/proto/auth.rs:207:33
+    |
+207 |     let stage2 = Sha256::digest(&stage1);
+    |                                 ^^^^^^^ help: change this to: `stage1`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+    = note: `-D clippy::needless-borrows-for-generic-args` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::needless_borrows_for_generic_args)]`
+
+error: the borrowed expression implements the required traits
+   --> src/proto/auth.rs:212:19
+    |
+212 |     hasher.update(&stage2);
+    |                   ^^^^^^^ help: change this to: `stage2`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+error: the borrowed expression implements the required traits
+   --> src/proto/handshake.rs:225:31
+    |
+225 |     let stage2 = Sha1::digest(&stage1);
+    |                               ^^^^^^^ help: change this to: `stage1`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+error: the borrowed expression implements the required traits
+   --> src/proto/handshake.rs:230:19
+    |
+230 |     hasher.update(&stage2);
+    |                   ^^^^^^^ help: change this to: `stage2`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#needless_borrows_for_generic_args
+
+error: could not compile `tribble` (lib) due to 17 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: could not compile `tribble` (lib test) due to 17 previous errors

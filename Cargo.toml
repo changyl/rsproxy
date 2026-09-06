@@ -1,0 +1,68 @@
+[package]
+name = "newproxy"
+version = "1.0.0"
+edition = "2021"
+description = "MySQL 分库分表代理 — Rust 原生实现"
+license = "UNLICENSED"
+
+[[bin]]
+name = "newproxy"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+parking_lot = "0.12"
+dashmap = "5"
+arc-swap = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+rand = "0.8"
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rust-ini = "0.20"
+thiserror = "1"
+anyhow = "1"
+tracing-appender = "0.2"
+regex = "1"
+futures = "0.3"
+log = "0.4"
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+rcgen = "0.13"
+
+# 配置中心(拓扑热更新)后端
+etcd-client = "0.19.0"
+zookeeper = "0.8.0"
+tokio-stream = "0.1"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+rand_chacha = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 4
+strip = true
+
+# 性能剖析用:与 release 等价但保留符号、关闭 LTO 加快构建
+# (配合 macOS `sample` / Instruments;符号采样不需要 LTO)
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+debug = 1
+
+# ── 磁盘优化(2026-09-02)────────────────────────────────────────────
+# 依赖(deps)debug 信息降为仅行号:target/debug 体积约降 2/3
+# (体积大头在第三方依赖的全量 debuginfo;自身 crate 不受影响,
+# 保持 profile.dev 默认 debug=2 完整调试——package 覆盖只作用于依赖)
+[profile.dev.package."*"]
+debug = "line-tables-only"

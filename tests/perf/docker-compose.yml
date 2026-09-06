@@ -1,0 +1,71 @@
+# NewProxy 性能测试 — 3 容器独立环境
+#
+# 架构:
+#   mysql:3306   ← MySQL 8.0（宿主机暴露 3307 避免和集成测试冲突）
+#   newproxy:4051 ← NewProxy 代理（连接 mysql:3306）
+#   sysbench     ← sysbench 压测工具（连接 newproxy:4051 或 mysql:3306）
+#
+# 启动: docker compose -f tests/perf/docker-compose.yml up -d --build
+# 压测: ./tests/integration/run.sh perf [prepare|baseline|proxy|run|all|cleanup]
+# 停止: docker compose -f tests/perf/docker-compose.yml down
+
+services:
+  # ─── MySQL 8.0 ───
+  mysql:
+    image: mysql:8.0
+    container_name: newproxy-perf-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: test_password
+      MYSQL_DATABASE: sbtest
+    ports:
+      - "3307:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --max-connections=1000
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    volumes:
+      - ./init_sysbench.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # ─── NewProxy Proxy ───
+  newproxy:
+    build:
+      context: ../..
+      dockerfile: tests/perf/Dockerfile
+      args:
+        # 基础镜像源:默认镜像加速器(直连 Docker Hub 在本机超时);
+        # 直连环境用环境变量覆盖: BASE_RUST=rust:1-bookworm BASE_DEBIAN=debian:bookworm-slim
+        BASE_RUST: ${BASE_RUST:-docker.m.daocloud.io/library/rust:1-bookworm}
+        BASE_DEBIAN: ${BASE_DEBIAN:-docker.m.daocloud.io/library/debian:bookworm-slim}
+    container_name: newproxy-perf
+    ports:
+      - "4051:4051"
+      - "9111:9111"   # 管理面板/API/Prometheus
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      # 配置以读写方式挂载:面板可改 slow_query_ms 等阈值并写回配置(测试慢查询阈值用);
+      # 容器内修改会同步写回宿主机 tests/perf/newproxy-perf-docker.conf
+      - ./newproxy-perf-docker.conf:/app/conf/newproxy.conf:rw
+
+  # ─── sysbench ───
+  sysbench:
+    build:
+      context: .
+      dockerfile: sysbench.Dockerfile
+      args:
+        BASE_DEBIAN: ${BASE_DEBIAN:-docker.m.daocloud.io/library/debian:bookworm-slim}
+    image: perf-sysbench
+    container_name: newproxy-perf-sysbench
+    depends_on:
+      - mysql
+      - newproxy
+    entrypoint: ["sleep", "infinity"]

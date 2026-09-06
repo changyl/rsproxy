@@ -1,0 +1,24 @@
+# NewProxy Rust 测试环境
+# 启动: colima start && docker compose up -d
+# 停止: docker compose down
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: newproxy-test-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: test_password
+      MYSQL_DATABASE: test
+    ports:
+      - "3306:3306"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - ./tools/init.sql:/docker-entrypoint-initdb.d/init.sql

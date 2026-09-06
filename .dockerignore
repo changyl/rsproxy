@@ -1,0 +1,11 @@
+# 构建上下文瘦身:仅需要 Cargo.toml / Cargo.lock / build.rs / src
+target/
+.git/
+.vscode/
+logs/
+docs/
+tests/
+tools/
+*.log
+*.pid
+.DS_Store
