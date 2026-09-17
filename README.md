@@ -1,10 +1,8 @@
 # newproxy（rsproxy）
 
-> MySQL 分库分表代理 —— **Rust / tokio 原生重写实现**，对齐 C 版 newproxy 的黑盒行为。
+> MySQL 代理 —— **Rust / tokio 原生实现**
 > 一个客户端连接 = 一个 tokio task，前端与后端均说 MySQL 原生协议，支持分片路由、
 > 主从读写分离、连接池、拓扑热更新与完整可观测性。
-
-`Cargo.toml` 包名与二进制名均为 `newproxy`。仓库目录名为 `rsproxy`。
 
 ---
 
@@ -39,8 +37,8 @@
 | **SQL 解析器** | 自研零拷贝词法器 + 结构化分析（CTE / UNION / 子查询 / 多表写） | ✅ |
 | **Scatter-Gather** | 跨分片广播执行计划 + 结果合并（Concat / 聚合 SUM 等） | ✅ |
 | **连接池** | 按分片分桶、权重负载均衡、失败转移、健康探测、空闲回收 | ✅ |
-| **主从读写分离** | 按语句类型分流，支持 Xenon Raft leader 自动发现 | ✅ |
-| **一致性档位** | strong / causal（GTID 屏障）/ session / eventual 四级 | ✅ |
+| **主从读写分离** | 按语句类型分流，支持 Raft leader/MGR 自动发现 | ✅ |
+| **读写一致性** | strong / causal（GTID 屏障）/ session / eventual 四级 | ✅ |
 | **拓扑热更新** | `checkproxy reload` / `SIGHUP` / 文件 mtime 自动监听 | ✅ |
 | **配置中心** | etcd / ZooKeeper，按分片粒度增量生效 + 断线容错 | ✅ |
 | **访问控制** | 产品用户 → 数据库用户映射、IP 白/黑名单、Token Bucket 限流 | ✅ |
@@ -150,10 +148,10 @@
 
 ### 6. 高可用与读写分离
 
-- **Xenon Raft 集成**：代理内建探测 `mysql.xenon_raft_status`，自动发现 raft leader 并跟随，
+- ** Xenon Raft集成**：代理内建探测 `mysql.xenon_raft_status`，自动发现 raft leader 并跟随，
   主从切换无需人工改配置（`[XenonRaft_*]` 按分片启用）。
 - **读写分离**：按语句类型（只读/写）与一致性档位决定走 master 还是 slave。
-- **一致性档位**（优先级：产品用户 > 库 > 分片默认 > strong）：
+- **读写一致性**（优先级：产品用户 > 库 > 分片默认 > strong）：
 
   | 档位 | 语义 |
   |---|---|
@@ -204,7 +202,7 @@ root=/newproxy
 | `checkproxy reload` | 热加载配置 | ✅ |
 | `checkproxy show pool` | 连接池状态 | 🚧 文本占位 |
 
-**管理 HTTP 服务**（`mng_port`，Basic Auth，与业务端口隔离）：
+**管理服务**（`mng_port`，Basic Auth，与业务端口隔离）：
 
 | 端点 | 用途 |
 |---|---|
