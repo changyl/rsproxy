@@ -294,6 +294,7 @@ fn make_cfg(backend_port: u16, default_db: Option<&str>) -> AppConfig {
                     slave: None,
                 }],
                 routes: vec![],
+                    xenon: None,
             }],
         },
     );
@@ -630,6 +631,7 @@ fn make_two_tablet_cfg(ports: (u16, u16)) -> AppConfig {
             slave: None,
         }],
         routes: vec![],
+            xenon: None,
     };
     clusters.insert(
         "c1".into(),

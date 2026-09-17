@@ -207,6 +207,9 @@ async fn run(config_path: String) -> anyhow::Result<()> {
         });
     }
 
+    // ─── Xenon raft 高可用 supervisor(受管分片发现/判主;无配置时空转)───
+    newproxy::ha::center::HaCenter::spawn_supervisor(ctx.clone());
+
     // ─── 热加载触发 1: SIGHUP 信号(kill -HUP <pid>) ───
     {
         let ctx = ctx.clone();

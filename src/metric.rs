@@ -131,16 +131,29 @@ pub struct QueryRecord {
     pub elapsed_us: u64,
     /// 是否慢查询(超过配置阈值)
     pub slow: bool,
-    /// 阶段耗时(µs):interval=命令间隔(含客户端空闲等待,非代理耗时),
-    /// parse=解析+拦截, setup=后端准备, send=发后端, forward=后端执行+转发
+    /// 阶段耗时(µs),完整请求链路 8 段:
+    /// interval=命令间隔(含客户端空闲等待,非代理耗时),parse=解析+拦截,
+    /// setup=后端准备, send=发后端命令,
+    /// exec=后端执行等待(发命令→后端首包到达),
+    /// recv=接收后端响应包(首包后的全部后端读),
+    /// cli_send=向客户端发送响应(缓冲写出+逐包),
+    /// 其他环节(解析外部分派等)极小,elapsed ≈ interval+8 段之外的调度间隙
     pub interval_us: u64,
     pub parse_us: u64,
     pub setup_us: u64,
     pub send_us: u64,
+    pub exec_us: u64,
+    pub recv_us: u64,
+    pub cli_send_us: u64,
+    /// 后端执行+转发合计(µs)= exec + recv + cli_send(兼容旧口径)
     pub forward_us: u64,
+    /// 读路由标识:None=非 SELECT 或未知;Some(reason)=该 SELECT 因 reason 发往主库
+    /// (如 "in-transaction"/"session-pinned"/"level-strong"/"for-update-share");
+    /// SELECT 走 follower 时为 Some("follower")。供面板单条排障定位主库读。
+    pub route: Option<String>,
 }
 
-/// 一条慢查询记录(含 5 阶段耗时,用于面板/排障定位慢在哪个环节)
+/// 一条慢查询记录(含 8 阶段耗时,用于面板/排障定位慢在哪个环节)
 #[derive(Debug, Clone, Serialize)]
 pub struct SlowQuery {
     /// 时间戳(Unix 秒)
@@ -155,13 +168,18 @@ pub struct SlowQuery {
     pub shard: String,
     /// 总耗时(µs)
     pub elapsed_us: u64,
-    /// 阶段耗时(µs):interval=命令间隔(含客户端空闲等待,非代理耗时),
-    /// parse=解析+拦截, setup=后端准备, send=发后端, forward=后端执行+转发
+    /// 阶段耗时(µs),含义同 QueryRecord 的 8 段分解
     pub interval_us: u64,
     pub parse_us: u64,
     pub setup_us: u64,
     pub send_us: u64,
+    pub exec_us: u64,
+    pub recv_us: u64,
+    pub cli_send_us: u64,
+    /// 后端执行+转发合计(µs)= exec + recv + cli_send(兼容旧口径)
     pub forward_us: u64,
+    /// 读路由标识(含义同 QueryRecord.route)
+    pub route: Option<String>,
 }
 
 // ─── 单值计数器 ───
@@ -233,6 +251,10 @@ pub struct Metrics {
     pub stage_parse_us: Counter,
     pub stage_setup_us: Counter,
     pub stage_send_us: Counter,
+    pub stage_exec_us: Counter,
+    pub stage_recv_us: Counter,
+    pub stage_cli_send_us: Counter,
+    /// 后端执行+转发合计(exec+recv+cli_send),保留旧口径兼容
     pub stage_forward_us: Counter,
 
     /// 查询总耗时累计(µs;直方图 `_sum` 数据源,除以 queries_total 得平均总耗时)
@@ -251,9 +273,11 @@ pub struct Metrics {
     /// 分片查询数统计(cluster.tablet → 查询次数;面板展示流量分布)
     pub shard_query_counts: DashMap<String, Counter>,
 
-    /// 分片阶段耗时累计(µs):cluster.tablet → [interval, parse, setup, send, forward]。
+    /// 分片阶段耗时累计(µs):cluster.tablet → [interval, parse, setup, send,
+    /// exec, recv, cli_send, forward]。前 7 项为独立阶段,末项 forward =
+    /// exec+recv+cli_send(后端执行+转发合计,兼容旧口径)。
     /// 面板按分片展示平均耗时(平均 = 累计 / shard_query_counts 对应计数)
-    pub shard_stage_us: DashMap<String, [u64; 5]>,
+    pub shard_stage_us: DashMap<String, [u64; 8]>,
 
     /// 最近慢查询(>1s)环形缓冲,有界;面板 /api/slow 数据源
     pub slow_queries: Mutex<VecDeque<SlowQuery>>,
@@ -284,6 +308,36 @@ pub struct Metrics {
     /// 按后端 MySQL 节点流量统计(cluster.tablet → [recv_bytes, sent_bytes,
     /// recv_pkts, sent_pkts];面板"后端节点流量"图数据源,未绑定节点归 "-")
     pub node_traffic: DashMap<String, [u64; 4]>,
+
+    // ── Xenon raft 高可用 / 一致性档位(XenonRaft 段启用时计数)──
+
+    /// raft 主节点发现探测失败次数(任一成员失败 +1)
+    pub ha_probe_errors: Counter,
+    /// raft leader 变更次数(切换生效后 +1)
+    pub ha_leader_changes: Counter,
+    /// 半同步退化为异步的事件次数(leader 侧 Rpl_semi_sync_master_status=OFF)
+    pub ha_semisync_degrade_events: Counter,
+    /// 探测期间无有效 leader(降级,keep-last-known/回退基线)次数
+    pub ha_degraded_cycles: Counter,
+    /// 读分流:实际落到 follower 的查询数
+    pub ha_reads_follower: Counter,
+    /// 读分流:屏障不可用/超时回落到 leader 的查询数
+    pub ha_reads_leader_fallback: Counter,
+    /// GTID 屏障等待超时次数(超预算回 leader)
+    pub ha_barrier_timeouts: Counter,
+
+    // ── 主库读路由标识(SELECT 因何种原因发往主库)──
+
+    /// 主库读按 用户×原因 计数:user = 产品用户名,"-" = 未知。
+    /// reason 取值与 consistency.rs 的 leader_reason 对齐:
+    /// in-transaction / session-pinned / level-strong / not-select / for-update-share /
+    /// lock-in-share / select-into / procedure-analyse / found-rows-prefix /
+    /// user-variable / session-function / no-statement / multi-statement /
+    /// follower-fallback(从库不可用/追不平降级)
+    pub leader_read_counts: DashMap<(String, String), u64>,
+
+    /// 主库读总数(全部原因合计;O(1) 供 Prometheus 总序列)
+    pub leader_reads_total: Counter,
 }
 
 impl Default for Metrics {
@@ -309,6 +363,9 @@ impl Metrics {
             stage_parse_us: Counter::default(),
             stage_setup_us: Counter::default(),
             stage_send_us: Counter::default(),
+            stage_exec_us: Counter::default(),
+            stage_recv_us: Counter::default(),
+            stage_cli_send_us: Counter::default(),
             stage_forward_us: Counter::default(),
             queries_elapsed_us: Counter::default(),
             latency_histogram: LatencyHistogram::new(),
@@ -325,7 +382,41 @@ impl Metrics {
             backend_error_stats: DashMap::new(),
             db_traffic: DashMap::new(),
             node_traffic: DashMap::new(),
+            ha_probe_errors: Counter::default(),
+            ha_leader_changes: Counter::default(),
+            ha_semisync_degrade_events: Counter::default(),
+            ha_degraded_cycles: Counter::default(),
+            ha_reads_follower: Counter::default(),
+            ha_reads_leader_fallback: Counter::default(),
+            ha_barrier_timeouts: Counter::default(),
+            leader_read_counts: DashMap::new(),
+            leader_reads_total: Counter::default(),
         }
+    }
+
+    /// 记录一次"发往主库的读"(按 产品用户 × 原因 计数 + 总数)。
+    ///
+    /// `user`:产品用户名(空归 "-");`reason`:主库原因标识
+    /// (见 `leader_read_counts` 字段注释;`None` = 非读语句或无需标识,
+    /// 调用方仅在 SELECT 类查询走主库时传入具体原因)。
+    pub fn record_leader_read(&self, user: &str, reason: &str) {
+        self.leader_reads_total.inc();
+        let ukey = if user.is_empty() { "-" } else { user };
+        *self
+            .leader_read_counts
+            .entry((ukey.to_string(), reason.to_string()))
+            .or_insert(0) += 1;
+    }
+
+    /// 主库读计数快照(按次数降序):((user, reason), count)
+    pub fn leader_reads_snapshot(&self) -> Vec<((String, String), u64)> {
+        let mut v: Vec<_> = self
+            .leader_read_counts
+            .iter()
+            .map(|e| (e.key().clone(), *e.value()))
+            .collect();
+        v.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        v
     }
 
     /// 记录一次 SQL 执行
@@ -386,7 +477,12 @@ impl Metrics {
     }
 
     /// 记录查询各阶段耗时(µs),供面板展示请求时间分布(平均 = 累计/查询数);
-    /// 同时按分片累计,供面板按分片对比各阶段耗时
+    /// 同时按分片累计,供面板按分片对比各阶段耗时。
+    ///
+    /// 阶段:read=interval, parse, setup, send, exec=后端执行等待(发命令→首包),
+    /// recv=收后端响应包(首包后), cli_send=发客户端;forward=后端执行+转发合计
+    /// (exec+recv+cli_send,兼容旧口径)。
+    #[allow(clippy::too_many_arguments)]
     pub fn record_query_stages(
         &self,
         shard: &str,
@@ -394,12 +490,18 @@ impl Metrics {
         parse_us: u64,
         setup_us: u64,
         send_us: u64,
+        exec_us: u64,
+        recv_us: u64,
+        cli_send_us: u64,
         forward_us: u64,
     ) {
         self.stage_interval_us.add(read_us);
         self.stage_parse_us.add(parse_us);
         self.stage_setup_us.add(setup_us);
         self.stage_send_us.add(send_us);
+        self.stage_exec_us.add(exec_us);
+        self.stage_recv_us.add(recv_us);
+        self.stage_cli_send_us.add(cli_send_us);
         self.stage_forward_us.add(forward_us);
         // 分片维度累计(空分片归入 "-",与 record_query 的 shard_query_counts 键一致)
         let shard_key = if shard.is_empty() { "-" } else { shard };
@@ -410,9 +512,21 @@ impl Metrics {
                 a[1] += parse_us;
                 a[2] += setup_us;
                 a[3] += send_us;
-                a[4] += forward_us;
+                a[4] += exec_us;
+                a[5] += recv_us;
+                a[6] += cli_send_us;
+                a[7] += forward_us;
             })
-            .or_insert([read_us, parse_us, setup_us, send_us, forward_us]);
+            .or_insert([
+                read_us,
+                parse_us,
+                setup_us,
+                send_us,
+                exec_us,
+                recv_us,
+                cli_send_us,
+                forward_us,
+            ]);
     }
 
     /// 记录一条慢查询(有界环形缓冲,淘汰最旧)
@@ -630,9 +744,10 @@ impl Metrics {
         v
     }
 
-    /// 分片阶段耗时快照:返回 (分片, 查询数, [interval, parse, setup, send, forward] 累计 µs),
-    /// 按查询数降序;查询数取自 shard_query_counts(与阶段累计同键)
-    pub fn shard_stages_snapshot(&self) -> Vec<(String, u64, [u64; 5])> {
+    /// 分片阶段耗时快照:返回 (分片, 查询数, [interval, parse, setup, send,
+    /// exec, recv, cli_send, forward] 累计 µs),按查询数降序;
+    /// 查询数取自 shard_query_counts(与阶段累计同键)
+    pub fn shard_stages_snapshot(&self) -> Vec<(String, u64, [u64; 8])> {
         let mut v: Vec<_> = self
             .shard_stage_us
             .iter()
@@ -666,6 +781,9 @@ impl Metrics {
             stage_parse_us: self.stage_parse_us.get(),
             stage_setup_us: self.stage_setup_us.get(),
             stage_send_us: self.stage_send_us.get(),
+            stage_exec_us: self.stage_exec_us.get(),
+            stage_recv_us: self.stage_recv_us.get(),
+            stage_cli_send_us: self.stage_cli_send_us.get(),
             stage_forward_us: self.stage_forward_us.get(),
         }
     }
@@ -689,6 +807,10 @@ pub struct MetricsSummary {
     pub stage_parse_us: u64,
     pub stage_setup_us: u64,
     pub stage_send_us: u64,
+    pub stage_exec_us: u64,
+    pub stage_recv_us: u64,
+    pub stage_cli_send_us: u64,
+    /// 后端执行+转发合计(exec+recv+cli_send)
     pub stage_forward_us: u64,
 }
 
@@ -821,22 +943,23 @@ mod tests {
         m.record_query("Q", "0.t0", 2000, 0, 1_000_000);
         m.record_query("Q", "0.t1", 500, 0, 1_000_000);
         // 分片阶段累计:不同分片独立聚合,空分片归入 "-"
-        m.record_query_stages("0.t0", 10, 20, 30, 40, 50);
-        m.record_query_stages("0.t0", 15, 25, 35, 45, 55);
-        m.record_query_stages("0.t1", 1, 2, 3, 4, 5);
-        m.record_query_stages("", 7, 7, 7, 7, 7);
+        // 8 段:interval, parse, setup, send, exec, recv, cli_send, forward
+        m.record_query_stages("0.t0", 10, 20, 30, 40, 50, 5, 5, 60);
+        m.record_query_stages("0.t0", 15, 25, 35, 45, 55, 5, 5, 65);
+        m.record_query_stages("0.t1", 1, 2, 3, 4, 5, 1, 1, 7);
+        m.record_query_stages("", 7, 7, 7, 7, 7, 7, 7, 21);
 
         let snap = m.shard_stages_snapshot();
         assert_eq!(snap.len(), 3);
         let t0 = snap.iter().find(|(k, _, _)| k == "0.t0").unwrap();
         assert_eq!(t0.1, 2);
-        assert_eq!(t0.2, [25, 45, 65, 85, 105]);
+        assert_eq!(t0.2, [25, 45, 65, 85, 105, 10, 10, 125]);
         let t1 = snap.iter().find(|(k, _, _)| k == "0.t1").unwrap();
         assert_eq!(t1.1, 1);
-        assert_eq!(t1.2, [1, 2, 3, 4, 5]);
+        assert_eq!(t1.2, [1, 2, 3, 4, 5, 1, 1, 7]);
         let dash = snap.iter().find(|(k, _, _)| k == "-").unwrap();
         assert_eq!(dash.1, 0); // 无查询计数但阶段有累计
-        assert_eq!(dash.2, [7, 7, 7, 7, 7]);
+        assert_eq!(dash.2, [7, 7, 7, 7, 7, 7, 7, 21]);
     }
 
     #[test]
@@ -877,7 +1000,11 @@ mod tests {
                 parse_us: 0,
                 setup_us: 0,
                 send_us: 0,
+                exec_us: 0,
+                recv_us: 0,
+                cli_send_us: 0,
                 forward_us: 0,
+                route: None,
             });
         }
         let list = m.slow_queries_snapshot();
@@ -897,7 +1024,11 @@ mod tests {
                 parse_us: 0,
                 setup_us: 0,
                 send_us: 0,
+                exec_us: 0,
+                recv_us: 0,
+                cli_send_us: 0,
                 forward_us: 0,
+                route: None,
             });
         }
         assert_eq!(m.recent_queries_snapshot().len(), MAX_RECENT_QUERIES);
@@ -910,12 +1041,38 @@ mod tests {
     fn summary_and_stage_accumulation() {
         let m = Metrics::new();
         m.record_query("Q", "0.t0", 1_000, 5, 1_000_000);
-        m.record_query_stages("0.t0", 10, 20, 30, 40, 50);
+        // 8 段:exec+recv+cli_send = 30+10+10 = 50 应等于 forward(兼容口径)
+        m.record_query_stages("0.t0", 10, 20, 30, 40, 30, 10, 10, 50);
         let s = m.summary();
         assert_eq!(s.queries_total, 1);
         assert_eq!(s.stage_parse_us, 20);
+        assert_eq!(s.stage_exec_us, 30);
+        assert_eq!(s.stage_recv_us, 10);
+        assert_eq!(s.stage_cli_send_us, 10);
         assert_eq!(s.stage_forward_us, 50);
         assert_eq!(s.pool_acquires, 0);
+    }
+
+    #[test]
+    fn leader_reads_counted_by_user_and_reason() {
+        let m = Metrics::new();
+        m.record_leader_read("app_user", "in-transaction");
+        m.record_leader_read("app_user", "in-transaction");
+        m.record_leader_read("app_user", "session-pinned");
+        m.record_leader_read("report", "level-strong");
+        // 空用户归 "-"
+        m.record_leader_read("", "follower-fallback");
+        assert_eq!(m.leader_reads_total.get(), 5);
+        let snap = m.leader_reads_snapshot();
+        assert_eq!(snap.len(), 4);
+        // 按次数降序:in-transaction(2) 在前
+        assert_eq!(
+            snap[0],
+            (("app_user".to_string(), "in-transaction".to_string()), 2)
+        );
+        assert!(snap.iter().any(|(k, n)| k.0 == "-"
+            && k.1 == "follower-fallback"
+            && *n == 1));
     }
 
     #[test]

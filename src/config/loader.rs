@@ -4,6 +4,7 @@
 // C 侧入口:tr_config.c:2284 tr_read_config → tr_config.c:2300 g_key_file_load_from_file
 // Section 分发:tr_config.c:2313-2371 前缀匹配
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::str::FromStr;
@@ -59,6 +60,9 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
             }
             s if s.starts_with("Slave_Host") => {
                 parse_host(&mut cfg, s, props, MasterSlave::Slave)?;
+            }
+            s if s.starts_with("XenonRaft") => {
+                parse_xenon_raft(&mut cfg, s, props)?;
             }
             s if s.starts_with("DB_User") => {
                 parse_db_user(&mut cfg, s, props)?;
@@ -226,6 +230,7 @@ fn parse_tablet(cfg: &mut AppConfig, section: &str, props: &Properties) -> Resul
         index,
         groups: Vec::new(),
         routes,
+        xenon: None,
     });
     Ok(())
 }
@@ -478,6 +483,170 @@ fn parse_config_center(cfg: &mut AppConfig, props: &Properties) -> Result<(), Co
 
     cfg.config_center = ConfigCenterCfg { kind, endpoints, root };
     Ok(())
+}
+
+// ─── Xenon Raft 分片段 ───
+
+/// 解析 `[XenonRaft_<cluster>_<tablet>]` 段,挂到对应 ClusterTablet.xenon。
+fn parse_xenon_raft(
+    cfg: &mut AppConfig,
+    section: &str,
+    props: &Properties,
+) -> Result<(), ConfigError> {
+    let rest = section
+        .strip_prefix("XenonRaft")
+        .unwrap_or(section)
+        .trim_start_matches('_');
+    let parts: Vec<&str> = rest.splitn(2, '_').collect();
+    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return Err(ConfigError::InvalidValue {
+            section: section.into(),
+            field: "section".into(),
+            value: section.into(),
+            reason: "期望格式 [XenonRaft_<cluster>_<tablet>]".into(),
+        });
+    }
+    let cluster_id = parts[0];
+    let tablet_name = parts[1];
+
+    let tablet = cfg
+        .clusters
+        .get_mut(cluster_id)
+        .and_then(|c| c.tablets.iter_mut().find(|t| t.tablet_id == tablet_name))
+        .ok_or_else(|| ConfigError::TabletNotFound(tablet_name.to_string()))?;
+
+    let mut x = XenonRaft::default();
+
+    // members(host:port 列表)
+    if let Some(members_raw) = props.get("members") {
+        let mut members = Vec::new();
+        for m in members_raw.split(',') {
+            let m = m.trim();
+            if m.is_empty() {
+                continue;
+            }
+            let (host, port) = split_host_port(section, "members", m)?;
+            members.push(RaftMember {
+                host,
+                mysql_port: port,
+                raft_endpoint: None,
+            });
+        }
+        x.members = members;
+    }
+    // raft_endpoints(与 members 对齐的可选列表;允许只给前几个/部分)
+    if let Some(eps_raw) = props.get("raft_endpoints") {
+        for (i, ep) in eps_raw.split(',').enumerate() {
+            let ep = ep.trim();
+            if ep.is_empty() {
+                continue;
+            }
+            if let Some(m) = x.members.get_mut(i) {
+                m.raft_endpoint = Some(ep.to_string());
+            } else {
+                return Err(ConfigError::InvalidValue {
+                    section: section.into(),
+                    field: "raft_endpoints".into(),
+                    value: ep.to_string(),
+                    reason: "成员数量超过 members".into(),
+                });
+            }
+        }
+    }
+    if x.members.is_empty() {
+        return Err(ConfigError::MissingField {
+            section: section.into(),
+            field: "members".into(),
+        });
+    }
+
+    // 节奏与档位
+    if let Some(v) = props.get("probe_interval") {
+        x.probe_interval_ms = parse_u64(section, "probe_interval", v)?;
+    }
+    if let Some(v) = props.get("probe_timeout_ms") {
+        x.probe_timeout_ms = parse_u64(section, "probe_timeout_ms", v)?;
+    }
+    if let Some(v) = props.get("leader_stale_ms") {
+        x.leader_stale_ms = parse_u64(section, "leader_stale_ms", v)?;
+    }
+    if let Some(v) = props.get("read_consistency") {
+        x.read_consistency = ReadConsistency::parse(v).ok_or_else(|| ConfigError::InvalidValue {
+            section: section.into(),
+            field: "read_consistency".into(),
+            value: v.to_string(),
+            reason: "期望 strong|causal|session|eventual".into(),
+        })?;
+    }
+    if let Some(v) = props.get("read_consistency_db") {
+        x.db_overrides = parse_consistency_overrides(section, "read_consistency_db", v)?;
+    }
+    if let Some(v) = props.get("read_consistency_user") {
+        x.user_overrides = parse_consistency_overrides(section, "read_consistency_user", v)?;
+    }
+    if let Some(v) = props.get("barrier_wait_ms") {
+        x.barrier_wait_ms = parse_u64(section, "barrier_wait_ms", v)?;
+    }
+    if let Some(v) = props.get("gtid_sample_cache_ms") {
+        x.gtid_sample_cache_ms = parse_u64(section, "gtid_sample_cache_ms", v)?;
+    }
+
+    tablet.xenon = Some(x);
+    Ok(())
+}
+
+/// 解析 `scope=level,scope=level` 形式的覆盖配置。
+fn parse_consistency_overrides(
+    section: &str,
+    field: &str,
+    v: &str,
+) -> Result<HashMap<String, ReadConsistency>, ConfigError> {
+    let mut map = HashMap::new();
+    for item in v.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (k, lvl) = item.split_once('=').ok_or_else(|| ConfigError::InvalidValue {
+            section: section.into(),
+            field: field.into(),
+            value: item.to_string(),
+            reason: "期望 scope=level 形式".into(),
+        })?;
+        let lvl = ReadConsistency::parse(lvl).ok_or_else(|| ConfigError::InvalidValue {
+            section: section.into(),
+            field: field.into(),
+            value: item.to_string(),
+            reason: "期望 strong|causal|session|eventual".into(),
+        })?;
+        map.insert(k.trim().to_ascii_lowercase(), lvl);
+    }
+    Ok(map)
+}
+
+/// 解析 `host:port`(port 必填,1-65535)。
+fn split_host_port(
+    section: &str,
+    field: &str,
+    v: &str,
+) -> Result<(String, u16), ConfigError> {
+    let (host, port_str) = v.split_once(':').ok_or_else(|| ConfigError::InvalidValue {
+        section: section.into(),
+        field: field.into(),
+        value: v.to_string(),
+        reason: "期望 host:port".into(),
+    })?;
+    let host = host.trim();
+    let port = parse_u16(section, field, port_str.trim())?;
+    if host.is_empty() {
+        return Err(ConfigError::InvalidValue {
+            section: section.into(),
+            field: field.into(),
+            value: v.to_string(),
+            reason: "host 为空".into(),
+        });
+    }
+    Ok((host.to_string(), port))
 }
 
 // ─── 后处理 ───
@@ -836,7 +1005,143 @@ users=app_user
         assert!(cfg.cluster_tablets.contains_key("0.t1"));
     }
 
-    // ─── 错误注入 / 边界路径补齐(走真实 load_config 分发循环)───
+    // ─── Xenon Raft 分片段 ───
+
+    const XENON_CONF: &str = r#"
+[MySQL_Proxy_Layer]
+port=4051
+
+[Cluster_0]
+name=test_cluster
+
+[CTablet_0_t0]
+name=t0
+
+[CTablet_0_t1]
+name=t1
+
+[XenonRaft_0_t0]
+members=xenon1:3306,xenon2:3306,xenon3:3306
+raft_endpoints=xenon1:8801,xenon2:8801
+probe_interval=1500
+probe_timeout_ms=600
+leader_stale_ms=4000
+read_consistency=eventual
+read_consistency_db=report=causal,audit=session
+read_consistency_user=finance=strong,report_api=eventual
+barrier_wait_ms=250
+gtid_sample_cache_ms=50
+"#;
+
+    #[test]
+    fn load_xenon_raft_section() {
+        let cfg = load_conf(XENON_CONF).unwrap();
+        let cluster = cfg.clusters.get("0").unwrap();
+        let t0 = cluster.tablets.iter().find(|t| t.tablet_id == "t0").unwrap();
+        let t1 = cluster.tablets.iter().find(|t| t.tablet_id == "t1").unwrap();
+        // t0 挂 xenon,t1 不挂
+        assert!(t1.xenon.is_none(), "未配置的分片不应有 xenon");
+        let x = t0.xenon.as_ref().expect("t0 should have xenon");
+        assert_eq!(x.members.len(), 3);
+        assert_eq!(x.members[0].host, "xenon1");
+        assert_eq!(x.members[0].mysql_port, 3306);
+        assert_eq!(x.members[0].raft_endpoint.as_deref(), Some("xenon1:8801"));
+        assert_eq!(x.members[2].raft_endpoint, None, "endpoint 列表可短于 members");
+        assert_eq!(x.probe_interval_ms, 1500);
+        assert_eq!(x.probe_timeout_ms, 600);
+        assert_eq!(x.leader_stale_ms, 4000);
+        assert_eq!(x.barrier_wait_ms, 250);
+        assert_eq!(x.gtid_sample_cache_ms, 50);
+        assert_eq!(x.read_consistency, ReadConsistency::Eventual);
+        assert_eq!(x.db_overrides.get("report"), Some(&ReadConsistency::Causal));
+        assert_eq!(x.db_overrides.get("audit"), Some(&ReadConsistency::Session));
+        assert_eq!(x.user_overrides.get("finance"), Some(&ReadConsistency::Strong));
+        assert_eq!(x.user_overrides.get("report_api"), Some(&ReadConsistency::Eventual));
+    }
+
+    #[test]
+    fn load_xenon_raft_defaults_when_partial() {
+        let cfg = load_conf(
+            r#"
+[MySQL_Proxy_Layer]
+port=4051
+[Cluster_0]
+name=c
+[CTablet_0_t0]
+name=t0
+[XenonRaft_0_t0]
+members=x1:3306,x2:3306
+"#,
+        )
+        .unwrap();
+        let x = cfg.clusters["0"].tablets[0].xenon.as_ref().unwrap();
+        assert_eq!(x.probe_interval_ms, 1000);
+        assert_eq!(x.leader_stale_ms, 3000);
+        assert_eq!(x.read_consistency, ReadConsistency::Strong, "缺省档位必须 strong");
+        assert!(x.db_overrides.is_empty());
+        assert_eq!(x.members.len(), 2);
+    }
+
+    #[test]
+    fn load_xenon_raft_errors() {
+        // 缺 members
+        assert!(load_conf(
+            r#"
+[MySQL_Proxy_Layer]
+port=4051
+[Cluster_0]
+name=c
+[CTablet_0_t0]
+name=t0
+[XenonRaft_0_t0]
+read_consistency=causal
+"#
+        )
+        .is_err());
+        // 非法档位
+        let e = load_conf(
+            r#"
+[MySQL_Proxy_Layer]
+port=4051
+[Cluster_0]
+name=c
+[CTablet_0_t0]
+name=t0
+[XenonRaft_0_t0]
+members=x1:3306
+read_consistency=bogus
+"#,
+        );
+        assert!(e.is_err(), "非法档位应报错");
+        // 分片不存在
+        assert!(load_conf(
+            r#"
+[MySQL_Proxy_Layer]
+port=4051
+[Cluster_0]
+name=c
+[CTablet_0_t0]
+name=t0
+[XenonRaft_0_nope]
+members=x1:3306
+"#
+        )
+        .is_err());
+        // members 无端口
+        assert!(load_conf(
+            r#"
+[MySQL_Proxy_Layer]
+port=4051
+[Cluster_0]
+name=c
+[CTablet_0_t0]
+name=t0
+[XenonRaft_0_t0]
+members=x1
+"#
+        )
+        .is_err());
+    }
 
     /// 写临时配置文件并 load_config(真实分发循环,而非手动重放)
     fn load_conf(text: &str) -> Result<AppConfig, ConfigError> {

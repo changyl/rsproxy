@@ -497,3 +497,45 @@ fn router_hint_in_sql() {
     );
     assert_eq!(s.router_hint.as_ref().unwrap().tablet_index, Some(2));
 }
+
+// ─── 复杂 SQL:语句类型 + 表名(无污染)───
+
+#[test]
+fn cte_union_and_subquery_classification() {
+    // CTE:WITH 后按主体 DML 分类
+    let s = classify("WITH c AS (SELECT id FROM t2) SELECT * FROM sbtest_1 JOIN c ON 1=1");
+    assert_eq!(s.stmt_type, StatementType::Select);
+    assert!(s.table_names.contains(&"sbtest_1".to_string()));
+    assert!(s.table_names.contains(&"t2".to_string()));
+    assert!(!s.table_names.contains(&"c".to_string())); // CTE 名不是物理表
+
+    let s = classify("SELECT * FROM t1 UNION SELECT * FROM t2 UNION ALL SELECT 1");
+    assert_eq!(s.stmt_type, StatementType::Select);
+    assert!(s.table_names.contains(&"t1".to_string()));
+    assert!(s.table_names.contains(&"t2".to_string()));
+
+    let s = classify("SELECT (SELECT MAX(x) FROM t2) FROM t1");
+    assert_eq!(s.stmt_type, StatementType::Select);
+    assert!(s.table_names.contains(&"t1".to_string()));
+    assert!(s.table_names.contains(&"t2".to_string()));
+}
+
+#[test]
+fn complex_tables_no_keyword_junk() {
+    // INSERT...SELECT:目标 + 源,不含 select/from/* 垃圾词
+    let s = classify("INSERT INTO t1 SELECT * FROM t2");
+    assert_eq!(s.table_names, vec!["t1".to_string(), "t2".to_string()]);
+
+    // 字符串含 FROM 不再污染表名
+    let s = classify("SELECT 'a FROM b' AS s, x FROM real_t");
+    assert_eq!(s.table_names, vec!["real_t".to_string()]);
+
+    // 多表 UPDATE / DELETE
+    let s = classify("UPDATE t1 JOIN t2 ON t1.id=t2.id SET t1.a=1");
+    assert!(s.table_names.contains(&"t1".to_string()));
+    assert!(s.table_names.contains(&"t2".to_string()));
+
+    let s = classify("DELETE t1 FROM t1 JOIN t2 ON t1.id=t2.id WHERE t2.x=1");
+    assert!(s.table_names.contains(&"t1".to_string()));
+    assert!(s.table_names.contains(&"t2".to_string()));
+}

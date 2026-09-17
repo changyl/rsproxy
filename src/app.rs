@@ -58,6 +58,9 @@ pub struct AppCtx {
     /// 运行时拓扑覆盖层(配置中心下发的动态拓扑;文件配置为静态基线)
     pub topology: Arc<RuntimeTopology>,
 
+    /// Xenon raft 高可用运行时(受管分片发现/状态;无配置时为空转)
+    pub ha: Arc<crate::ha::center::HaCenter>,
+
     /// 活跃连接注册表(cid -> 连接信息),show connections / kill 的数据源
     pub connections: DashMap<u32, ConnHandle>,
 
@@ -82,6 +85,7 @@ impl AppCtx {
             srv_pool,
             metrics: Arc::new(Metrics::new()),
             topology: Arc::new(RuntimeTopology::new()),
+            ha: Arc::new(crate::ha::center::HaCenter::new()),
             connections: DashMap::new(),
             config_path,
             connection_id: AtomicU32::new(1),
@@ -366,6 +370,7 @@ cluster_name=test_cluster
                     index: 0,
                     groups,
                     routes: vec![],
+                    xenon: None,
                 }],
             },
         );

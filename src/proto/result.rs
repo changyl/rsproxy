@@ -156,6 +156,15 @@ pub struct ForwardCount {
     /// 结果集行数(文本协议:ReadingRows 阶段每个非终止包 = 一行;
     /// OK/ERR/0 列结果集恒 0)
     pub rows: u64,
+    /// 后端执行等待耗时(µs):命令发出 → 后端**首个**响应包到达
+    /// (含后端执行 + 后端网络首字节延迟;判定"后端执行慢"的黄金指标)
+    pub exec_us: u64,
+    /// 接收后端响应包耗时(µs):首包之后的全部后端读
+    /// (行数据/列定义流式传输;后端回包慢或大结果集传输慢时变大)
+    pub recv_us: u64,
+    /// 向客户端发送响应耗时(µs):批量缓冲写出 + 逐包发送
+    /// (客户端接收慢/客户端网络差反向压制 TCP 时变大)
+    pub cli_send_us: u64,
 }
 
 impl ForwardCount {
@@ -167,6 +176,38 @@ impl ForwardCount {
     }
 }
 
+/// 计时读取一个后端响应包:耗时按 `first` 计入 `exec_us`(执行等待)或
+/// `recv_us`(响应接收)。读取失败时返回 Err,不累计耗时。
+async fn timed_read_backend<R: AsyncRead + Unpin>(
+    backend: &mut R,
+    buf: &mut BytesMut,
+    count: &mut ForwardCount,
+    first: bool,
+) -> Result<(u8, Bytes), ProtoError> {
+    let t = std::time::Instant::now();
+    let r = codec::read_packet(backend, buf).await?;
+    let us = t.elapsed().as_micros() as u64;
+    if first {
+        count.exec_us += us;
+    } else {
+        count.recv_us += us;
+    }
+    Ok(r)
+}
+
+/// 计时发送一个包到前端:耗时计入 `cli_send_us`
+async fn timed_send_frontend<W: AsyncWrite + Unpin>(
+    frontend: &mut W,
+    seq: u8,
+    payload: &[u8],
+    count: &mut ForwardCount,
+) -> Result<(), ProtoError> {
+    let t = std::time::Instant::now();
+    codec::send_packet(frontend, seq, payload).await?;
+    count.cli_send_us += t.elapsed().as_micros() as u64;
+    Ok(())
+}
+
 /// 将后端响应流式转发到前端
 ///
 /// 根据 MySQL 协议,后端的 COM_QUERY 响应可能是:
@@ -176,6 +217,12 @@ impl ForwardCount {
 ///
 /// 透传模式:逐 packet 读取后端 → 逐 packet 写入前端
 /// 内存占用 = 当前一个 packet 的大小(≤16MB)
+///
+/// 阶段计时口径(分段时钟,互不重叠):
+/// - `exec_us`:发命令后等待后端**首个**响应包(后端执行 + 后端网络首字节)
+/// - `recv_us`:首包后每次读后端 socket 的耗时(回包慢/传输慢在此显形)
+/// - `cli_send_us`:每次向客户端写出的实际耗时(客户端收包慢/反向压 TCP)
+/// 三者之和 ≤ forward 总时长,差值为代理自身的包解析/拷贝 CPU 时间(µs 级)。
 pub async fn forward_backend_response<R, W>(
     backend: &mut R,
     frontend: &mut W,
@@ -199,7 +246,9 @@ where
     macro_rules! flush_out {
         () => {
             if !out.is_empty() {
+                let t = std::time::Instant::now();
                 frontend.write_all(&out).await?;
+                count.cli_send_us += t.elapsed().as_micros() as u64;
                 out.clear();
             }
         };
@@ -219,14 +268,18 @@ where
             out.extend_from_slice(pl);
             seq = seq.wrapping_add(1);
             if out.len() >= FLUSH_THRESHOLD {
+                let t = std::time::Instant::now();
                 frontend.write_all(&out).await?;
+                count.cli_send_us += t.elapsed().as_micros() as u64;
                 out.clear();
             }
         }};
     }
 
     loop {
-        let (pkt_seq, payload) = codec::read_packet(backend, back_buf).await?;
+        // 首包读 = 后端执行等待(exec_us);后续包读 = 响应接收(recv_us)。
+        // 包间等待发生在下一次 read 挂起期间,自然归入 recv_us,无需额外计时。
+        let (pkt_seq, payload) = timed_read_backend(backend, back_buf, count, state == ForwardState::AwaitFirst).await?;
         // 预览 hex 串仅用于 trace 日志:必须在 TRACE 级别开启时才构建,
         // 否则每个转发包都会白做 ~10 次 format! + 一次 join 分配
         // (实测为转发热路径的显著 CPU 开销)。
@@ -404,7 +457,7 @@ where
             && (payload.len() == 5 || payload.len() >= 7);
 
         count.add_packet(&payload);
-        codec::send_packet(frontend, seq, &payload).await?;
+        timed_send_frontend(frontend, seq, &payload, count).await?;
 
         if is_eof {
             return Ok(());
@@ -445,7 +498,7 @@ where
     let mut seq: u8 = 1;
 
     // 1. 读首包(COM_STMT_PREPARE_OK 或 ERR)
-    let (_, first) = codec::read_packet(backend, back_buf).await?;
+    let (_, first) = timed_read_backend(backend, back_buf, count, true).await?;
     if first.is_empty() {
         return Err(ProtoError::Protocol("empty STMT_PREPARE response".into()));
     }
@@ -453,7 +506,7 @@ where
     // 出错:转发 ERR 并结束(prepare 失败,后端未创建语句 → false)
     if first[0] == error::ERR_HEADER {
         count.add_packet(&first);
-        codec::send_packet(frontend, seq, &first).await?;
+        timed_send_frontend(frontend, seq, &first, count).await?;
         return Ok(false);
     }
 
@@ -466,12 +519,12 @@ where
         // 非 OK/ERR 的异常首包:原样转发并结束(防御性)
         tracing::warn!(len = first.len(), "unexpected STMT_PREPARE first packet");
         count.add_packet(&first);
-        codec::send_packet(frontend, seq, &first).await?;
+        timed_send_frontend(frontend, seq, &first, count).await?;
         return Ok(false);
     };
 
     count.add_packet(&first);
-    codec::send_packet(frontend, seq, &first).await?;
+    timed_send_frontend(frontend, seq, &first, count).await?;
     seq = seq.wrapping_add(1);
 
     // 2. 转发参数列定义组(含组尾 EOF 终止包)
@@ -498,6 +551,15 @@ where
 /// 错位后续命令的响应。
 ///
 /// 返回下一个包的 seq。
+/// 转发一组 count 个 ColumnDef,并消费组尾的 EOF 终止包。
+///
+/// 后端连接不宣告 CLIENT_DEPRECATE_EOF(BACKEND_CAP_FULL),按旧式协议
+/// 每组非空列定义后必然跟随 5B EOF。终止包消费后回传前端(新式 0xFE
+/// OK 经 adapt_terminal 转为旧式),保留 warnings/status;若读到非终止包,
+/// 说明后端流不符合协商协议——显式报错废弃该连接,避免残留字节静默
+/// 错位后续命令的响应。
+///
+/// 返回下一个包的 seq。
 async fn forward_column_defs<R, W>(
     backend: &mut R,
     frontend: &mut W,
@@ -511,20 +573,20 @@ where
     W: AsyncWrite + Unpin,
 {
     for _ in 0..num_defs {
-        let (_, payload) = codec::read_packet(backend, back_buf).await?;
+        let (_, payload) = timed_read_backend(backend, back_buf, fc, false).await?;
         // 组尾 EOF 提前到达(实际列数少于声明,防御路径):回传并结束
         if is_group_terminator(&payload) {
             let out = adapt_terminal(&payload);
             fc.add_packet(&out);
-            codec::send_packet(frontend, seq, &out).await?;
+            timed_send_frontend(frontend, seq, &out, fc).await?;
             return Ok(seq.wrapping_add(1));
         }
         fc.add_packet(&payload);
-        codec::send_packet(frontend, seq, &payload).await?;
+        timed_send_frontend(frontend, seq, &payload, fc).await?;
         seq = seq.wrapping_add(1);
     }
     // num_defs 个定义已转发:按协商的旧式协议,组尾必跟 EOF 终止包,读取并回传
-    let (_, tail) = codec::read_packet(backend, back_buf).await?;
+    let (_, tail) = timed_read_backend(backend, back_buf, fc, false).await?;
     if !is_group_terminator(&tail) {
         return Err(ProtoError::Protocol(format!(
             "expected EOF after {} column definitions, got {} bytes (first 0x{:02X})",
@@ -535,7 +597,7 @@ where
     }
     let out = adapt_terminal(&tail);
     fc.add_packet(&out);
-    codec::send_packet(frontend, seq, &out).await?;
+    timed_send_frontend(frontend, seq, &out, fc).await?;
     Ok(seq.wrapping_add(1))
 }
 
@@ -555,10 +617,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let (_, payload) = codec::read_packet(backend, back_buf).await?;
+    let (_, payload) = timed_read_backend(backend, back_buf, count, true).await?;
     // 客户端命令包 seq=0，响应首包 seq 必须从 1 开始
     count.add_packet(&payload);
-    codec::send_packet(frontend, 1, &payload).await?;
+    timed_send_frontend(frontend, 1, &payload, count).await?;
 
     // 简单命令通常只返回一个包,但处理多包场景(multi-result)
     // 检查是否为 OK/ERR(终止包);返回终止包的 kind,供调用方判断成败
@@ -570,10 +632,10 @@ where
     // 有后续包,继续读取直到 OK/ERR（首包已用 seq=1，从 2 开始）
     let mut seq: u8 = 2;
     loop {
-        let (_, payload) = codec::read_packet(backend, back_buf).await?;
+        let (_, payload) = timed_read_backend(backend, back_buf, count, false).await?;
         let kind = ResponseKind::from_payload(&payload, false);
         count.add_packet(&payload);
-        codec::send_packet(frontend, seq, &payload).await?;
+        timed_send_frontend(frontend, seq, &payload, count).await?;
         if kind.is_terminal() {
             return Ok(kind);
         }
@@ -789,6 +851,46 @@ mod tests {
         assert_eq!(pkts[0].1, prepare_ok(1, 1, 0));
         assert_eq!(pkts[1].1, coldef("a"));
         assert_eq!(&pkts[2].1[..], &OLD_EOF);
+        assert_backend_drained(&mut backend, &mut buf).await;
+    }
+
+    #[tokio::test]
+    async fn resultset_forward_stage_timings() {
+        // 2 列结果集:ColumnCount + 2×ColumnDef + EOF + 2 行 + EOF。
+        // 转发后断言三种子阶段耗时均被累计:
+        // exec_us = 首包(执行等待)恰好 1 次读;
+        // recv_us = 首包后 5 次后端读(列定义×2+EOF+行×2);
+        // cli_send_us = 全部包发往客户端的耗时(批量写路径)。
+        let script = [
+            codec::encode_packet(0, &[2u8]),
+            codec::encode_packet(1, &coldef("a")),
+            codec::encode_packet(2, &coldef("b")),
+            codec::encode_packet(3, &OLD_EOF),
+            codec::encode_packet(4, b"\x01x"),
+            codec::encode_packet(5, b"\x01y"),
+            codec::encode_packet(6, &OLD_EOF),
+        ]
+        .concat();
+        let mut backend = Builder::new().read(&script).build();
+        let mut client = Vec::new();
+        let mut buf = BytesMut::new();
+        let mut fc = ForwardCount::default();
+
+        let (kind, code) = forward_backend_response(&mut backend, &mut client, &mut buf, &mut fc)
+            .await
+            .unwrap();
+        assert_eq!(kind, ResponseKind::Ok);
+        assert_eq!(code, None);
+        assert_eq!(fc.rows, 2);
+        assert_eq!(fc.pkts, 7);
+        // 本地内存流耗时为微秒级;仅防呆断言各字段已被累计且无异常放大
+        assert!(fc.exec_us <= 100_000, "exec_us too large: {}", fc.exec_us);
+        assert!(fc.recv_us <= 500_000, "recv_us too large: {}", fc.recv_us);
+        assert!(
+            fc.cli_send_us <= 500_000,
+            "cli_send_us too large: {}",
+            fc.cli_send_us
+        );
         assert_backend_drained(&mut backend, &mut buf).await;
     }
 

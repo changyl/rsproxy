@@ -175,6 +175,8 @@ struct BackendSession {
     /// `selected_db != bucket_db`,归还时丢弃连接而非回池,避免污染
     /// 按 db 分桶的池(否则下个会话复用到错误库的连接)。
     bucket_db: String,
+    /// 连接角色(读写分离:Master=leader 连接,Slave=follower 连接)
+    role: crate::config::MasterSlave,
 }
 
 impl BackendSession {
@@ -240,6 +242,12 @@ struct FrontConn {
     ctx: Arc<AppCtx>,
     /// 会话级粘滞后端连接(首次查询时懒建立,之后复用)
     backend: Option<BackendSession>,
+    /// 显式事务中(BEGIN/START TRANSACTION … COMMIT/ROLLBACK;读分流强制 leader)
+    in_txn: bool,
+    /// 会话被 pin 到 leader(读分流关闭):SET / @变量 / prepared 等
+    read_pinned: bool,
+    /// 各分片最近是否执行过写(会话一致水位需要;键 = "cluster.tablet")
+    written_shards: std::collections::HashMap<String, bool>,
     /// 本次查询实际使用的后端分片(cluster.tablet;指标分片维度,空=未绑定)
     backend_shard: String,
     /// 客户端登录时指定的数据库名(CLIENT_CONNECT_WITH_DB)
@@ -270,6 +278,9 @@ impl FrontConn {
             seq: 0,
             ctx,
             backend: None,
+            in_txn: false,
+            read_pinned: false,
+            written_shards: std::collections::HashMap::new(),
             backend_shard: String::new(),
             client_database: None,
             current_db: None,
@@ -484,8 +495,9 @@ impl FrontConn {
         // 阶段计时:interval = 命令间隔(距上一条命令的等待,**含客户端空闲**,
         // 非代理耗时;数据到达后的实际读包是 µs 级,无法与等待分离故一并归此);
         // parse = 解析+本地拦截检测。
-        // 与 handle_query 内的 setup/send/forward 一起构成完整请求阶段分解,
-        // 慢请求可定位到:客户端发包间隔长 / 解析慢 / 后端准备慢 / 发送慢 / 后端执行慢。
+        // 与 handle_query 内的 setup/send/exec/recv/cli_send 一起构成完整请求阶段分解,
+        // 慢请求可定位到:客户端发包间隔长 / 解析慢 / 后端准备慢 / 发送慢 /
+        // 后端执行等待慢 / 后端回包慢 / 向客户端发送慢。
         let t_cmd_start = std::time::Instant::now();
         // 读取前端命令
         let (_pkt_seq, payload) = codec::read_packet(&mut self.stream, &mut self.read_buf).await?;
@@ -760,20 +772,78 @@ impl FrontConn {
 
         // 按表尾号路由:解析 SQL 表名 → 目标分片(每条查询动态切换后端)。
         // 无尾号表走默认第一个分片;无表语句(SELECT 1 等)保持当前后端。
-        // 热路径只用表名 → 轻量提取(避免 classify 的两次 to_uppercase 全串拷贝)
+        // 热路径只用表名 → token 化轻量提取(非 DML 前缀窥探即返回,无全串拷贝)。
         let tables = crate::parser::classify::table_names_for_routing(&sql_text);
         let target = self.route_tablet_target(&cfg, &tables);
-        // 建立后端连接。若后端认证失败（如数据库不存在），
-        // 将错误消息转发给客户端而非直接断开连接。
-        if let Err(e) = self.ensure_backend(db_user, target.as_ref()).await {
-            if let ProtoError::AuthFailed(msg) = &e {
-                let err_pkt = crate::proto::error::build_error(1049, "42000", msg);
-                self.send_client(1, &err_pkt).await?;
-                return Ok(());
+
+        // 读写分离:受管分片 + 一致性档位非 strong 时,可分流纯读走 follower。
+        let qkind = query_kind(&sql_text);
+        let read_plan = if qkind == QueryKind::Select {
+            self.plan_read_route(
+                &cfg,
+                target.as_ref().map(|(a, b)| (a.as_str(), b.as_str())),
+                db_user,
+                &sql_text,
+            )
+        } else {
+            None
+        };
+        let want_follower = matches!(
+            read_plan.as_ref(),
+            Some((d, _)) if d.role == crate::ha::consistency::RouteRole::Follower
+        );
+        // 读路由标识:SELECT 发往主库时记录原因(计数 + 单条记录排障用)。
+        // plan_read_route 返回 None 表示未进入分流决策(非受管/strong 直通),
+        // 这类 SELECT 同样发往主库,原因记 "level-strong";决策进入但被判主库
+        // 时用决策器给出的 leader_reason(in-transaction/session-pinned/…)。
+        let mut route_reason: Option<String> = None;
+        if qkind == QueryKind::Select {
+            if want_follower {
+                route_reason = Some("follower".to_string());
+            } else {
+                let reason = read_plan
+                    .as_ref()
+                    .and_then(|(d, _)| d.leader_reason)
+                    .unwrap_or("level-strong");
+                route_reason = Some(reason.to_string());
+                // 主库读计数:产品用户 × 原因(面板"主库读分布"表/Prometheus label)
+                self.ctx.metrics.record_leader_read(&pu.username, reason);
             }
-            let setup_ms = t0.elapsed().as_millis() as u64;
-            error!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, interval_us, parse_us, setup_ms, err = %e, "backend connect failed");
-            return Err(e);
+        }
+
+        // 建立后端连接(leader 或 follower;后者按档位可带 GTID 屏障)。
+        // 若后端认证失败（如数据库不存在），将错误消息转发给客户端而非直接断开。
+        let ensure_res = if want_follower {
+            let wait = read_plan.as_ref().and_then(|(_, w)| *w);
+            self.ensure_backend_ex(db_user, target.as_ref(), MasterSlave::Slave, wait)
+                .await
+        } else {
+            self.ensure_backend_ex(db_user, target.as_ref(), MasterSlave::Master, None)
+                .await
+        };
+        let effective_role = match ensure_res {
+            Ok(r) => r,
+            Err(e) => {
+                if let ProtoError::AuthFailed(msg) = &e {
+                    let err_pkt = crate::proto::error::build_error(1049, "42000", msg);
+                    self.send_client(1, &err_pkt).await?;
+                    return Ok(());
+                }
+                let setup_ms = t0.elapsed().as_millis() as u64;
+                error!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, interval_us, parse_us, setup_ms, err = %e, "backend connect failed");
+                return Err(e);
+            }
+        };
+        // 降级修正:请求 follower 但从库不可用/追不平回落主库时,
+        // 路由标识从 "follower" 改标为 "follower-fallback",并计入主库读
+        // (原因维度;user 维度已在下方统一由 route_reason 判定,这里只改标签)。
+        if want_follower && effective_role == MasterSlave::Master {
+            if route_reason.as_deref() == Some("follower") {
+                route_reason = Some("follower-fallback".to_string());
+                self.ctx
+                    .metrics
+                    .record_leader_read(&pu.username, "follower-fallback");
+            }
         }
         let t1 = std::time::Instant::now(); // 后端已就绪(池获取/新建+握手)
 
@@ -796,6 +866,8 @@ impl FrontConn {
             debug!(addr = %self.peer_addr, cid = self.cid, "text PREPARE detected, backend connection won't be pooled");
             let backend = self.backend.as_mut().unwrap();
             backend.mark_no_reuse();
+            // prepared 语句绑定在后端,会话读不再分流(读写分离关闭)
+            self.read_pinned = true;
         }
         debug!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, sql = %sql_log, "query start");
 
@@ -871,10 +943,33 @@ impl FrontConn {
                 }
             }
         }
+        // 会话状态簿记(读分流状态机):BEGIN/COMMIT/ROLLBACK、SET、写标记。
+        // 仅在 fwd_ok(后端 OK)时更新,避免失败语句污染状态。
+        if fwd_ok {
+            match qkind {
+                QueryKind::Begin => self.in_txn = true,
+                QueryKind::Commit | QueryKind::Rollback => self.in_txn = false,
+                QueryKind::Set => {
+                    if !self.read_pinned {
+                        self.read_pinned = true;
+                        debug!(addr = %self.peer_addr, cid = self.cid, "session read pinned to leader (SET)");
+                    }
+                }
+                // 会话一致水位:记录本会话在本分片写过(读己之写需要屏障)
+                QueryKind::Write if !self.backend_shard.is_empty() => {
+                    self.written_shards.insert(self.backend_shard.clone(), true);
+                }
+                _ => {}
+            }
+        }
         let t3 = std::time::Instant::now(); // 响应已转发完毕
 
         // 阶段耗时分解(µs/ms 双精度):setup=后端准备(首个查询含建连握手),
-        // send=发送命令到后端,forward=后端执行+响应转发(通常占大头),
+        // send=发送命令到后端,
+        // exec=后端执行等待(send 完→后端首个响应包到达;判定后端执行慢的关键),
+        // recv=接收后端响应包(首包之后全部后端读;回包慢/大结果集传输慢时大),
+        // cli_send=向客户端发送响应(批量缓冲写出+逐包;客户端收包慢时大),
+        // forward=后端执行+转发合计(exec+recv+cli_send,兼容旧口径),
         // elapsed=总耗时(含 setup,自 t0 起)。
         let elapsed_us = (t3 - t0).as_micros() as u64;
         let elapsed_ms = (t3 - t0).as_millis() as u64;
@@ -884,6 +979,10 @@ impl FrontConn {
         let setup_us = (t1 - t0).as_micros() as u64;
         let send_us = (t2 - t1).as_micros() as u64;
         let forward_us = (t3 - t2).as_micros() as u64;
+        // 子阶段(转发层 fc 计时):后端执行等待 / 收后端包 / 发客户端包
+        let exec_us = fc.exec_us;
+        let recv_us = fc.recv_us;
+        let cli_send_us = fc.cli_send_us;
         // 慢查询阈值来自配置(ms → µs),热加载动态生效
         let slow_threshold_us = cfg.slow_query_ms.saturating_mul(1000);
         // Top SQL 按模板聚合(字面量归一化为 ?),日志/列表仍保留原始 SQL
@@ -902,6 +1001,9 @@ impl FrontConn {
             parse_us,
             setup_us,
             send_us,
+            exec_us,
+            recv_us,
+            cli_send_us,
             forward_us,
         );
         let is_slow = elapsed_us > slow_threshold_us;
@@ -927,11 +1029,16 @@ impl FrontConn {
                     parse_us,
                     setup_us,
                     send_us,
+                    exec_us,
+                    recv_us,
+                    cli_send_us,
                     forward_us,
+                    route: route_reason.clone(),
                 });
         }
         // 所有查询入"最近查询"缓冲(有界;面板 /api/recent 可按 SQL/db/用户
         // 检索单条执行的 5 阶段耗时,不受日志级别影响)
+        let route_tag = route_reason.clone().unwrap_or_else(|| "-".to_string());
         self.ctx
             .metrics
             .record_recent_query(crate::metric::QueryRecord {
@@ -946,13 +1053,17 @@ impl FrontConn {
                 parse_us,
                 setup_us,
                 send_us,
+                exec_us,
+                recv_us,
+                cli_send_us,
                 forward_us,
+                route: route_reason,
             });
 
         if elapsed_us > 1_000_000 {
-            warn!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, elapsed_ms, interval_us, parse_us, setup_ms, send_ms, forward_ms, sql = %sql_log, "slow query");
+            warn!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, elapsed_ms, interval_us, parse_us, setup_ms, send_ms, exec_us, recv_us, cli_send_us, forward_ms, route = %route_tag, sql = %sql_log, "slow query");
         } else {
-            debug!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, elapsed_ms, interval_us, parse_us, setup_ms, send_ms, forward_ms, sql = %sql_log, "query done");
+            debug!(addr = %self.peer_addr, cid = self.cid, user = %pu.username, elapsed_ms, interval_us, parse_us, setup_ms, send_ms, exec_us, recv_us, cli_send_us, forward_ms, route = %route_tag, sql = %sql_log, "query done");
         }
         Ok(())
     }
@@ -1180,6 +1291,72 @@ impl FrontConn {
         None
     }
 
+    /// 读分流计划:受管分片且生效档位非 strong 时,为纯 SELECT 计算角色与屏障。
+    /// 返回 Some((decision, barrier_wait_ms))——decision.role==Follower 才走从库。
+    fn plan_read_route(
+        &self,
+        cfg: &AppConfig,
+        target: Option<(&str, &str)>,
+        db_user: Option<&DbUser>,
+        sql: &str,
+    ) -> Option<(crate::ha::consistency::RouteDecision, Option<u64>)> {
+        use crate::config::ReadConsistency;
+        use crate::ha::consistency::{Barrier, RouteRole, SessionView};
+
+        let (cid, tid) = target?;
+        let x = cfg
+            .clusters
+            .get(cid)?
+            .tablets
+            .iter()
+            .find(|t| t.tablet_id == tid)?
+            .xenon
+            .as_ref()?;
+        if x.read_consistency == ReadConsistency::Strong
+            && x.db_overrides.is_empty()
+            && x.user_overrides.is_empty()
+        {
+            return None; // 默认 strong:零开销
+        }
+        // 生效档位:用户 > 库 > 分片默认
+        let mut lvl = x.read_consistency;
+        let db = self
+            .client_database
+            .clone()
+            .or_else(|| db_user.and_then(|u| u.default_db.clone()))
+            .unwrap_or_default();
+        if let Some(v) = x.db_overrides.get(&db.to_ascii_lowercase()) {
+            lvl = *v;
+        }
+        if let Some(pu) = &self.product_user {
+            if let Some(v) = x.user_overrides.get(&pu.username.to_ascii_lowercase()) {
+                lvl = *v;
+            }
+        }
+        if lvl == ReadConsistency::Strong {
+            return None;
+        }
+        let read_class = crate::parser::analyze::classify_read_only(sql);
+        let sess = SessionView {
+            in_txn: self.in_txn,
+            pinned: self.read_pinned,
+            session_dirty_shard: self
+                .written_shards
+                .get(&format!("{cid}.{tid}"))
+                .copied()
+                .unwrap_or(false),
+        };
+        let d = crate::ha::consistency::decide(lvl, read_class, sess);
+        if d.role != RouteRole::Follower {
+            return Some((d, None));
+        }
+        let wait = match d.barrier {
+            Barrier::WaitHighWater => Some(x.barrier_wait_ms),
+            Barrier::None => None,
+        };
+        Some((d, wait))
+    }
+
     /// 解析指定分片 (cluster_id, tablet_id) 的 master 后端(池键 + 建连目标)。
     /// 运行时拓扑覆盖层(配置中心下发)优先,未命中回落文件配置。
     fn resolve_master(
@@ -1254,171 +1431,456 @@ impl FrontConn {
 
     /// 确保会话级后端连接已建立(懒初始化),之后整个会话复用。
     ///
-    /// 优先从全局连接池 `SrvPool` 取空闲连接(miss 时新建),
-    /// 保证事务/会话状态正确。连接生命周期由 `BackendSession::Drop` 管理。
-    ///
-    /// `target`:本次查询期望的目标分片 (cluster_id, tablet_id)。
-    /// - 与当前绑定一致 → 直接复用;
-    /// - 不一致 → 归还当前连接并切换到目标分片(按表尾号逐查询路由);
-    /// - None → 无表语句(如 SELECT 1)保持当前后端;尚未绑定时绑定第一个分片。
+    /// 包装:默认 leader 角色(写与不可分流读都走 raft leader)。
     async fn ensure_backend(
         &mut self,
         db_user: Option<&DbUser>,
         target: Option<&(String, String)>,
     ) -> Result<(), ProtoError> {
+        self.ensure_backend_ex(db_user, target, MasterSlave::Master, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// 角色感知的连接保证(读写分离核心)。
+    ///
+    /// - `role=Master`:解析目标分片 raft leader(拓扑覆盖优先),现有语义;
+    /// - `role=Slave`:按候选链(followers)建立 follower 连接,`barrier_wait_ms`
+    ///   为 Some 时在建连后先执行 GTID 高水位屏障(WAIT_FOR_EXECUTED_GTID_SET),
+    ///   失败(从库追不平/错误)自动回落到 leader;
+    /// - leader 建连失败且为 xenon 受管分片时,触发 raft 重探一次后按新 leader
+    ///   重试一次(仅 ensure 阶段,查询字节未发出,不会重复执行)。
+    ///
+    /// 用状态循环实现(Slave → Master 单向降级),避免 async 递归。
+    ///
+    /// 返回最终生效的后端角色:调用方据此修正读路由标识
+    /// (请求 follower 但降级主库时,记录改标为 "follower-fallback")。
+    async fn ensure_backend_ex(
+        &mut self,
+        db_user: Option<&DbUser>,
+        target: Option<&(String, String)>,
+        role: MasterSlave,
+        barrier_wait_ms: Option<u64>,
+    ) -> Result<MasterSlave, ProtoError> {
+        let mut role = role;
+        let mut barrier_wait_ms = barrier_wait_ms;
+        loop {
+            let cfg = self.ctx.load_config();
+            let mut connect_attempt = 0u32;
+
+            // 目标分片与当前绑定对比(角色也要一致):命中直接复用/按需补屏障
+            if let Some((cid, tid)) = target {
+                let key = format!("{cid}.{tid}");
+                if self.backend.is_some() {
+                    let same_shard = self.backend_shard == key;
+                    let same_role = self.backend.as_ref().map(|b| b.role == role).unwrap_or(false);
+                    if same_shard && same_role {
+                        if role == MasterSlave::Slave {
+                            if let Some(ms) = barrier_wait_ms {
+                                match self.run_gtid_barrier(db_user, cid, tid, ms).await {
+                                    Ok(true) => return Ok(role),
+                                    _ => {
+                                        self.backend = None; // WAIT-only,干净归还
+                                        self.backend_shard.clear();
+                                        self.ctx.metrics.ha_reads_leader_fallback.inc();
+                                        role = MasterSlave::Master;
+                                        barrier_wait_ms = None;
+                                        continue;
+                                    }
+                                }
+                            }
+                            return Ok(role);
+                        }
+                        return Ok(role);
+                    }
+                    // 分片或角色不一致 → 归还当前连接
+                    self.backend = None;
+                    self.backend_shard.clear();
+                }
+            } else if role == MasterSlave::Master && self.backend.is_some() {
+                return Ok(role); // 无目标且已绑定 → 保持当前后端
+            } else if role == MasterSlave::Slave {
+                // follower 只服务于带目标分片的纯读;无目标 → 回退 leader 语义
+                role = MasterSlave::Master;
+                barrier_wait_ms = None;
+                continue;
+            }
+
+            // ── 解析目标地址 ──(master_addr 供连接/兜底/屏障采样)
+            let (cluster_id, tablet_id, db_arc, master_addr): (
+                String,
+                String,
+                std::sync::Arc<crate::config::Database>,
+                (String, u16),
+            ) = if role == MasterSlave::Slave {
+                let (cid, tid) = target
+                    .as_ref()
+                    .ok_or_else(|| ProtoError::Protocol("follower needs target".into()))?;
+                let (h, p, c, t, d) = self
+                    .resolve_master(&cfg, cid, tid)
+                    .ok_or_else(|| ProtoError::Protocol(format!("no leader for tablet {cid}.{tid}")))?;
+                (c, t, d, (h, p))
+            } else {
+                match target {
+                    Some((cid, tid)) => {
+                        let (h, p, c, t, d) = self.resolve_master(&cfg, cid, tid).ok_or_else(|| {
+                            ProtoError::Protocol(format!("no backend for tablet {cid}.{tid}"))
+                        })?;
+                        (c, t, d, (h, p))
+                    }
+                    None => {
+                        let (h, p, c, t, d) = self
+                            .resolve_first_master(&cfg)
+                            .ok_or_else(|| ProtoError::Protocol("no backend configured".into()))?;
+                        (c, t, d, (h, p))
+                    }
+                }
+            };
+            self.backend_shard = format!("{cluster_id}.{tablet_id}");
+
+            // follower 候选;无候选 → 降级 leader
+            let mut candidates: Vec<(String, u16)> = if role == MasterSlave::Slave {
+                let v = self.follower_candidates(&cfg, &cluster_id, &tablet_id);
+                if v.is_empty() {
+                    role = MasterSlave::Master;
+                    barrier_wait_ms = None;
+                    continue;
+                }
+                v
+            } else {
+                vec![master_addr]
+            };
+
+            let ha_managed = cfg
+                .clusters
+                .get(&cluster_id)
+                .and_then(|c| c.tablets.iter().find(|t| t.tablet_id == tablet_id))
+                .map(|t| t.xenon.is_some())
+                .unwrap_or(false);
+
+            let user_id = db_user.map(|u| u.username.as_str()).unwrap_or("");
+            let bucket_cfg = BucketCfg {
+                max_serve_times: cfg.conn_pool_socket_max_serve_client_times,
+                ..BucketCfg::default()
+            };
+            let target_db = self
+                .client_database
+                .clone()
+                .or_else(|| db_user.and_then(|u| u.default_db.clone()));
+            let db_key = target_db.as_deref().unwrap_or_default();
+
+            // 先试池(按角色队列)
+            let mut pool_hit: Option<BackendSession> = None;
+            for (host, port) in &candidates {
+                if let Some(back_conn) = self.ctx.srv_pool.try_acquire(
+                    &cluster_id,
+                    &tablet_id,
+                    user_id,
+                    db_key,
+                    role,
+                ) {
+                    self.ctx.metrics.pool_acquires.inc();
+                    let bucket = self.ctx.srv_pool.get_or_create_bucket(
+                        &cluster_id,
+                        &tablet_id,
+                        user_id,
+                        db_key,
+                        bucket_cfg.clone(),
+                    );
+                    let guard = BackendGuard::new(back_conn, bucket);
+                    let stream = guard.take_stream();
+                    info!(%host, %port, "reused backend connection from pool");
+                    let buf = BytesMut::with_capacity(4096);
+                    if let Some(db) = &target_db {
+                        self.set_current_db(Some(db.to_string()));
+                    }
+                    if let Some(h) = self.reg.as_ref() {
+                        *h.backends.write() = vec![format!("{host}:{port}")];
+                    }
+                    pool_hit = Some(BackendSession {
+                        stream: Some(stream),
+                        buf,
+                        guard: Some(guard),
+                        selected_db: target_db.clone(),
+                        bucket_db: db_key.to_string(),
+                        role,
+                    });
+                    break;
+                }
+            }
+            if let Some(session) = pool_hit {
+                self.backend = Some(session);
+                if role == MasterSlave::Slave {
+                    if let Some(ms) = barrier_wait_ms {
+                        let ok = self
+                            .run_gtid_barrier(db_user, &cluster_id, &tablet_id, ms)
+                            .await
+                            .unwrap_or(false);
+                        if !ok {
+                            // 追不平 → 归还该连接(仅执行过 WAIT),降级 leader
+                            //(外层循环首部会按 Master 角色重新解析)
+                            self.backend = None;
+                            self.ctx.metrics.ha_reads_leader_fallback.inc();
+                            self.ctx.metrics.ha_barrier_timeouts.inc();
+                            role = MasterSlave::Master;
+                            barrier_wait_ms = None;
+                            continue;
+                        }
+                    }
+                    self.ctx.metrics.ha_reads_follower.inc();
+                }
+                return Ok(role);
+            }
+
+            // 池 miss:新建连接
+            loop {
+                let (host, port) = &candidates[0];
+                info!(%host, %port, "connecting to backend (pool miss)");
+                let conn_res = tokio::net::TcpStream::connect((host.as_str(), *port)).await;
+                let mut stream = match conn_res {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.ctx.metrics.pool_acquire_fails.inc();
+                        if role == MasterSlave::Slave {
+                            candidates.remove(0);
+                            if !candidates.is_empty() {
+                                continue;
+                            }
+                            self.ctx.metrics.ha_reads_leader_fallback.inc();
+                            role = MasterSlave::Master;
+                            barrier_wait_ms = None;
+                            break; // 回外层循环走 leader 新建路径
+                        }
+                        // leader:首次失败且受管 → raft 重探一次
+                        if connect_attempt == 0 && ha_managed {
+                            connect_attempt = 1;
+                            warn!(addr = %format!("{host}:{port}"), cluster = %cluster_id,
+                                tablet = %tablet_id,
+                                "xenon raft: leader connect failed, forcing re-probe");
+                            crate::ha::center::HaCenter::force_probe_async(
+                                self.ctx.clone(),
+                                cluster_id.clone(),
+                                tablet_id.clone(),
+                            )
+                            .await;
+                            let cfg = self.ctx.load_config();
+                            if let Some((h2, p2, _, _, _)) =
+                                self.resolve_master(&cfg, &cluster_id, &tablet_id)
+                            {
+                                if h2 != *host || p2 != *port {
+                                    info!(host = %h2, port = p2, "xenon raft re-probe switched leader; retrying connect once");
+                                    candidates[0] = (h2, p2);
+                                    continue;
+                                }
+                            }
+                        }
+                        return Err(e.into());
+                    }
+                };
+                stream.set_nodelay(true)?;
+                let mut buf = BytesMut::with_capacity(4096);
+                if let Err(e) = do_backend_handshake(
+                    &mut stream,
+                    db_user,
+                    self.client_database.as_deref(),
+                    &mut buf,
+                    cfg.default_charset,
+                )
+                .await
+                {
+                    self.ctx.metrics.pool_acquire_fails.inc();
+                    if role == MasterSlave::Slave {
+                        candidates.remove(0);
+                        if !candidates.is_empty() {
+                            continue;
+                        }
+                        self.ctx.metrics.ha_reads_leader_fallback.inc();
+                        role = MasterSlave::Master;
+                        barrier_wait_ms = None;
+                        break;
+                    }
+                    return Err(e);
+                }
+                let (host, port) = candidates[0].clone();
+                info!(%host, %port, "backend handshake complete");
+
+                let addr = stream
+                    .peer_addr()
+                    .map_err(|e| ProtoError::Protocol(format!("peer_addr: {e}")))?;
+                let back_conn = std::sync::Arc::new(BackConn::new(addr, db_arc.clone(), role));
+                *back_conn.stream.lock() = Some(stream);
+                let bucket = self.ctx.srv_pool.get_or_create_bucket(
+                    &cluster_id,
+                    &tablet_id,
+                    user_id,
+                    db_key,
+                    bucket_cfg.clone(),
+                );
+                let guard = BackendGuard::new(back_conn, bucket);
+                let mut stream = guard.take_stream();
+
+                let mut selected_db = None;
+                if let Some(db) = &target_db {
+                    match select_database(&mut stream, db, &mut buf).await {
+                        Ok(()) => {
+                            debug!(%host, %port, db, "selected database on fresh backend");
+                            self.set_current_db(Some(db.clone()));
+                            selected_db = Some(db.clone());
+                        }
+                        Err(e) => {
+                            warn!(%host, %port, db, "select database on fresh backend failed: {e}");
+                            self.set_current_db(None);
+                        }
+                    }
+                }
+                if let Some(h) = self.reg.as_ref() {
+                    *h.backends.write() = vec![format!("{host}:{port}")];
+                }
+                self.backend = Some(BackendSession {
+                    stream: Some(stream),
+                    buf,
+                    guard: Some(guard),
+                    selected_db,
+                    bucket_db: db_key.to_string(),
+                    role,
+                });
+                if role == MasterSlave::Slave {
+                    if let Some(ms) = barrier_wait_ms {
+                        let ok = self
+                            .run_gtid_barrier(db_user, &cluster_id, &tablet_id, ms)
+                            .await
+                            .unwrap_or(false);
+                        if !ok {
+                            // 追不平 → 归还该连接(仅执行过 WAIT),降级 leader:
+                            // break 出内层建连循环,由外层按 Master 重新解析
+                            self.backend = None;
+                            self.ctx.metrics.ha_reads_leader_fallback.inc();
+                            self.ctx.metrics.ha_barrier_timeouts.inc();
+                            role = MasterSlave::Master;
+                            barrier_wait_ms = None;
+                            break;
+                        }
+                    }
+                    self.ctx.metrics.ha_reads_follower.inc();
+                }
+                return Ok(role);
+            }
+            // 内层循环结束(role 已降为 Master)→ 外层 continue 重新解析
+        }
+    }
+
+    /// follower 候选:topology.slaves > 配置 slave > xenon members(减 leader)。
+    fn follower_candidates(
+        &self,
+        cfg: &AppConfig,
+        cluster_id: &str,
+        tablet_id: &str,
+    ) -> Vec<(String, u16)> {
+        let mut out: Vec<(String, u16)> = Vec::new();
+        if let Some(topo) = self.ctx.topology.get(cluster_id, tablet_id) {
+            for s in &topo.slaves {
+                let k = (s.host.clone(), s.port);
+                if !out.contains(&k) {
+                    out.push(k);
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(t) = cfg
+                .clusters
+                .get(cluster_id)
+                .and_then(|c| c.tablets.iter().find(|t| t.tablet_id == tablet_id))
+            {
+                for g in &t.groups {
+                    if let Some(sl) = g.slave.as_ref() {
+                        let k = (sl.host.clone(), sl.port);
+                        if !out.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                }
+                if let Some(x) = &t.xenon {
+                    let leader_addr = self
+                        .ctx
+                        .topology
+                        .get(cluster_id, tablet_id)
+                        .and_then(|tp| tp.master.clone())
+                        .map(|m| (m.host, m.port));
+                    for m in &x.members {
+                        let k = (m.host.clone(), m.mysql_port);
+                        if leader_addr.as_ref() == Some(&k) {
+                            continue;
+                        }
+                        if !out.contains(&k) {
+                            out.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 在当前后端连接上执行 GTID 高水位屏障:先取 leader `@@GLOBAL.gtid_executed`,
+    /// 再在同连接执行 `SELECT WAIT_FOR_EXECUTED_GTID_SET(...)`;返回是否就绪。
+    async fn run_gtid_barrier(
+        &mut self,
+        db_user: Option<&DbUser>,
+        cluster_id: &str,
+        tablet_id: &str,
+        wait_ms: u64,
+    ) -> Result<bool, String> {
+        let Some(db_user) = db_user else {
+            return Ok(false);
+        };
         let cfg = self.ctx.load_config();
+        let charset = cfg.default_charset;
+        let (leader_host, leader_port) = self
+            .resolve_master(&cfg, cluster_id, tablet_id)
+            .map(|(h, p, _, _, _)| (h, p))
+            .ok_or_else(|| "no leader resolved for barrier".to_string())?;
 
-        // 目标分片与当前绑定对比:命中复用,不一致则切换(归还当前连接到池)
-        if let Some((cid, tid)) = target {
-            let key = format!("{cid}.{tid}");
-            if self.backend.is_some() {
-                if self.backend_shard == key {
-                    return Ok(());
-                }
-                self.backend = None; // Drop → 归还连接
-                self.backend_shard.clear();
-            }
-        }
-        if self.backend.is_some() {
-            return Ok(()); // 无目标且已绑定 → 保持当前后端
-        }
-
-        // 解析目标分片 master(指定分片优先,否则第一个 master 后端)
-        let (host, port, cluster_id, tablet_id, db_arc) = match target {
-            Some((cid, tid)) => self.resolve_master(&cfg, cid, tid).ok_or_else(|| {
-                ProtoError::Protocol(format!("no backend for tablet {cid}.{tid}"))
-            })?,
-            None => self
-                .resolve_first_master(&cfg)
-                .ok_or_else(|| ProtoError::Protocol("no backend configured".into()))?,
-        };
-        // 记录本次查询的后端分片(指标分片维度)
-        self.backend_shard = format!("{cluster_id}.{tablet_id}");
-
-        let user_id = db_user.map(|u| u.username.as_str()).unwrap_or("");
-        let bucket_cfg = BucketCfg {
-            max_serve_times: cfg.conn_pool_socket_max_serve_client_times,
-            ..BucketCfg::default()
-        };
-        // 目标库:客户端 auth 指定优先,回落配置 default_db。
-        // 池按 (cluster, tablet, user, db) 分桶:桶内连接已选好库,取用无需
-        // 再向后端发 COM_INIT_DB(消除交替分片场景每查询一次的后端往返);
-        // 新建连接时仍会选库一次(见下方 select_database)。
-        let target_db = self
-            .client_database
-            .clone()
-            .or_else(|| db_user.and_then(|u| u.default_db.clone()));
-        let db_key = target_db.as_deref().unwrap_or_default();
-
-        // 1) 尝试从池中取空闲连接(已认证、库已选,可直接使用)
-        if let Some(back_conn) = self.ctx.srv_pool.try_acquire(
-            &cluster_id,
-            &tablet_id,
-            user_id,
-            &db_key,
-            MasterSlave::Master,
-        ) {
-            // 池命中(取到空闲连接)计入监控指标
-            self.ctx.metrics.pool_acquires.inc();
-            let bucket = self.ctx.srv_pool.get_or_create_bucket(
-                &cluster_id,
-                &tablet_id,
-                user_id,
-                &db_key,
-                bucket_cfg,
-            );
-            let guard = BackendGuard::new(back_conn, bucket);
-            let stream = guard.take_stream();
-            info!(%host, %port, "reused backend connection from pool");
-            let buf = BytesMut::with_capacity(4096);
-            // 桶按 db 分桶 → 复用连接已选好库,跳过 COM_INIT_DB
-            if let Some(db) = &target_db {
-                self.set_current_db(Some(db.to_string()));
-            }
-            if let Some(h) = self.reg.as_ref() {
-                *h.backends.write() = vec![format!("{host}:{port}")];
-            }
-            self.backend = Some(BackendSession {
-                stream: Some(stream),
-                buf,
-                guard: Some(guard),
-                selected_db: target_db.clone(),
-                bucket_db: db_key.to_string(),
-            });
-            return Ok(());
-        }
-
-        // 2) 池 miss(或复用失败):新建连接
-        info!(%host, %port, "connecting to backend (pool miss)");
-        let mut stream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
-            Ok(s) => s,
-            Err(e) => {
-                // 新建失败(网络不可达等)计入池获取失败监控指标
-                self.ctx.metrics.pool_acquire_fails.inc();
-                return Err(e.into());
-            }
-        };
-        stream.set_nodelay(true)?;
-        let mut buf = BytesMut::with_capacity(4096);
-        if let Err(e) = do_backend_handshake(
-            &mut stream,
+        // 1) 采样 leader 已提交前缀(通过探测客户端;不占用会话连接)
+        let res = crate::ha::probe::query_text(
+            &leader_host,
+            leader_port,
             db_user,
-            self.client_database.as_deref(),
-            &mut buf,
-            cfg.default_charset,
+            charset,
+            "SELECT @@GLOBAL.gtid_executed",
+            wait_ms.saturating_add(1500),
         )
-        .await
-        {
-            // 后端认证失败(库不存在/账号错等)同样计入池获取失败
-            self.ctx.metrics.pool_acquire_fails.inc();
-            return Err(e);
+        .await?;
+        let set = res
+            .rows
+            .first()
+            .and_then(|r| r.first().cloned())
+            .flatten()
+            .ok_or_else(|| "leader gtid_executed empty".to_string())?;
+        if set.trim().is_empty() {
+            return Err("leader gtid_executed empty".into());
         }
-        info!(%host, %port, "backend handshake complete");
 
-        // 新建 BackConn 并注册到桶,挂上 guard
-        let addr = stream
-            .peer_addr()
-            .map_err(|e| ProtoError::Protocol(format!("peer_addr: {e}")))?;
-        let back_conn = std::sync::Arc::new(BackConn::new(addr, db_arc, MasterSlave::Master));
-        // 将已握手完成的 stream 存入 BackConn
-        *back_conn.stream.lock() = Some(stream);
-        let bucket = self.ctx.srv_pool.get_or_create_bucket(
-            &cluster_id,
-            &tablet_id,
-            user_id,
-            &db_key,
-            bucket_cfg,
+        // 2) 在当前(follower)连接上等待该前缀(WAIT 与原 SELECT 同连接)
+        let wait_sql = format!(
+            "SELECT WAIT_FOR_EXECUTED_GTID_SET('{}', {})",
+            set.replace('\'', "''"),
+            wait_ms
         );
-        let guard = BackendGuard::new(back_conn, bucket);
-        let mut stream = guard.take_stream();
-
-        // 新建连接:选库一次(池内连接靠桶键保证库,无需重复 COM_INIT_DB)
-        let mut selected_db = None;
-        if let Some(db) = &target_db {
-            match select_database(&mut stream, db, &mut buf).await {
-                Ok(()) => {
-                    debug!(%host, %port, db, "selected database on fresh backend");
-                    self.set_current_db(Some(db.clone()));
-                    selected_db = Some(db.clone());
-                }
-                Err(e) => {
-                    warn!(%host, %port, db, "select database on fresh backend failed: {e}");
-                    self.set_current_db(None);
-                }
-            }
-        }
-        if let Some(h) = self.reg.as_ref() {
-            *h.backends.write() = vec![format!("{host}:{port}")];
-        }
-
-        self.backend = Some(BackendSession {
-            stream: Some(stream),
-            buf,
-            guard: Some(guard),
-            selected_db,
-            bucket_db: db_key.to_string(),
-        });
-        Ok(())
+        let backend = self.backend.as_mut().ok_or("no backend for barrier")?;
+        let stream = backend
+            .stream
+            .as_mut()
+            .ok_or_else(|| "backend stream missing".to_string())?;
+        let r = crate::ha::probe::query_text_on_stream(stream, &mut backend.buf, &wait_sql)
+            .await?;
+        let ok = r
+            .rows
+            .first()
+            .and_then(|row| row.first().cloned())
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        Ok(ok)
     }
 
     /// 处理简单透传命令(COM_INIT_DB / COM_STATISTICS),复用会话级后端连接
@@ -1563,6 +2025,8 @@ impl FrontConn {
         let mut fc = result::ForwardCount::default();
         match cmd.command {
             Command::StmtPrepare => {
+                // prepared 语句绑定在后端,本会话读不再分流(读写分离关闭)
+                self.read_pinned = true;
                 // COM_STMT_PREPARE 响应:COM_STMT_PREPARE_OK + params列定义 + EOF
                 // + columns列定义 + EOF。首包 0x00 会被通用转发误判为 OK,故专用。
                 match result::forward_stmt_prepare_response(
@@ -1636,7 +2100,7 @@ impl FrontConn {
 // ─── 后端握手辅助 ───
 
 /// 完成后端 MySQL 的完整握手(mysql_native_password)
-async fn do_backend_handshake(
+pub(crate) async fn do_backend_handshake(
     stream: &mut TcpStream,
     db_user: Option<&DbUser>,
     default_db: Option<&str>,
@@ -1799,36 +2263,145 @@ async fn do_backend_handshake(
     Ok((gre, next_seq))
 }
 
-/// 提取简单 `USE <db>` 语句的库名(忽略大小写/首尾空白/尾分号)。
+/// 提取简单 `USE <db>` 语句的库名(忽略大小写/首尾空白/尾分号/前导注释)。
 ///
-/// 用于转发后同步会话库跟踪:带复杂修饰(反引号/空白/多语句)返回 None,
-/// 此时不跟踪——会话结束连接因 selected_db != 桶键 db 会被丢弃,安全降级。
-/// 热路径零分配:非 USE 查询仅做 4 字节前缀比较即返回。
+/// 基于词法器:首 token 为 USE、次 token 为库名(支持反引号/双引号包裹,
+/// 如 `` USE `my db` ``);其后只允许空白/注释/尾分号。
+/// 非 USE 查询只扫前 1~2 个 token 即返回 None,热路径零全串拷贝。
 fn use_db_name(sql: &str) -> Option<String> {
-    let t = sql.trim().trim_end_matches(';').trim();
-    let b = t.as_bytes();
-    // 前 3 字节 "USE"(忽略大小写)且后随空白;`t[4..]` 取库名
-    if b.len() < 5 || !b[..3].eq_ignore_ascii_case(b"USE") || !b[3].is_ascii_whitespace() {
+    use crate::parser::lex::{self, Lexer, TokenKind};
+
+    let mut lexer = Lexer::new(sql);
+    // 跳过前导注释,取首个 token
+    let first = loop {
+        match lexer.next_token() {
+            None => return None,
+            Some(t) if t.kind == TokenKind::Comment => continue,
+            Some(t) => break t,
+        }
+    };
+    if !lex::is_word(sql, first, "use") {
         return None;
     }
-    let db = t[4..].trim();
-    if db.is_empty() || db.contains('`') || db.chars().any(|c| c.is_whitespace()) {
-        return None;
+    let second = loop {
+        match lexer.next_token() {
+            None => return None,
+            Some(t) if t.kind == TokenKind::Comment => continue,
+            Some(t) => break t,
+        }
+    };
+    let db = match second.kind {
+        // 反引号/引号包裹或裸标识符都算库名;去掉包裹符并解码双写转义
+        TokenKind::Word | TokenKind::Str => {
+            let raw = second.text(sql);
+            let (inner, wrap) = if raw.len() >= 2 && raw.starts_with('`') && raw.ends_with('`') {
+                (&raw[1..raw.len() - 1], '`')
+            } else if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+                (&raw[1..raw.len() - 1], '"')
+            } else {
+                (raw, '\0')
+            };
+            let decoded = if wrap == '`' {
+                inner.replace("``", "`")
+            } else if wrap == '"' {
+                inner.replace("\"\"", "\"")
+            } else if wrap == '\'' {
+                inner.replace("''", "'")
+            } else {
+                inner.to_string()
+            };
+            if decoded.is_empty() {
+                return None;
+            }
+            decoded
+        }
+        _ => return None,
+    };
+    // 之后只允许注释与尾分号
+    loop {
+        match lexer.next_token() {
+            None => return Some(db.to_string()),
+            Some(t) if t.kind == TokenKind::Comment => continue,
+            Some(t) if t.kind == TokenKind::Punct && t.text(sql) == ";" => {
+                // 分号后只允许空白/注释/更多分号
+                loop {
+                    match lexer.next_token() {
+                        None => return Some(db.to_string()),
+                        Some(t2) if t2.kind == TokenKind::Comment => continue,
+                        Some(t2) if t2.kind == TokenKind::Punct && t2.text(sql) == ";" => continue,
+                        _ => return None,
+                    }
+                }
+            }
+            _ => return None,
+        }
     }
-    Some(db.to_string())
+}
+
+/// 语句"种类"(读写分离状态机的最小判定;基于词法器首词,忽略大小写/前导注释)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryKind {
+    Select,
+    Begin,
+    Commit,
+    Rollback,
+    Set,
+    /// INSERT/UPDATE/DELETE/REPLACE 等写(执行成功后标记会话写过)
+    Write,
+    Other,
+}
+
+fn query_kind(sql: &str) -> QueryKind {
+    use crate::parser::lex::{self, Lexer, TokenKind};
+    let mut lexer = Lexer::new(sql);
+    let first = loop {
+        match lexer.next_token() {
+            None => return QueryKind::Other,
+            Some(t) if t.kind == TokenKind::Comment => continue,
+            Some(t) => break t,
+        }
+    };
+    if first.kind != TokenKind::Word {
+        return QueryKind::Other;
+    }
+    let w = first.text(sql).to_ascii_lowercase();
+    match w.as_str() {
+        "select" | "with" | "(" => QueryKind::Select,
+        "begin" => QueryKind::Begin,
+        "start" => {
+            // START TRANSACTION 才开事务;START SLAVE 等按 Other
+            match lexer.next_token() {
+                Some(t)
+                    if t.kind == TokenKind::Word
+                        && lex::eq_ignore_ascii_case(t.text(sql), "transaction") =>
+                {
+                    QueryKind::Begin
+                }
+                _ => QueryKind::Other,
+            }
+        }
+        "commit" => QueryKind::Commit,
+        "rollback" => QueryKind::Rollback,
+        "set" => QueryKind::Set,
+        "insert" | "update" | "delete" | "replace" => QueryKind::Write,
+        _ => QueryKind::Other,
+    }
 }
 
 /// 轻量判断 SQL 是否为文本协议 PREPARE 语句(`PREPARE stmt FROM ...`)。
 ///
-/// 无堆分配:仅 trim 前导空白后比较首 7 字节(忽略大小写)且后随空白。
-/// MySQL 语法中 PREPARE 是保留字,以此开头的合法语句只可能是 PREPARE 语句;
-/// 若需精确识别(前导注释等),可改用 parser 的完整 classify。
+/// 基于词法器:跳过前导注释后首个 token 为 PREPARE 关键字即可
+/// (MySQL 语法中 PREPARE 是保留字,以此开头的合法语句只可能是 PREPARE)。
 fn is_text_prepare(sql: &str) -> bool {
-    let t = sql.trim_start();
-    let b = t.as_bytes();
-    b.len() >= 7
-        && b[..7].eq_ignore_ascii_case(b"prepare")
-        && (b.len() == 7 || b[7].is_ascii_whitespace())
+    use crate::parser::lex::{self, Lexer, TokenKind};
+    let mut lexer = Lexer::new(sql);
+    loop {
+        match lexer.next_token() {
+            None => return false,
+            Some(t) if t.kind == TokenKind::Comment => continue,
+            Some(t) => return lex::is_word(sql, t, "prepare"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1841,11 +2414,17 @@ mod tests {
         assert_eq!(use_db_name("USE sbtest"), Some("sbtest".to_string()));
         assert_eq!(use_db_name("use test2;"), Some("test2".to_string()));
         assert_eq!(use_db_name("  USE  mydb  ;  "), Some("mydb".to_string()));
+        assert_eq!(use_db_name("USE `my db`"), Some("my db".to_string()));
+        assert_eq!(use_db_name("USE `a``b`"), Some("a`b".to_string()));
+        assert_eq!(use_db_name("-- c\nUSE sbtest"), Some("sbtest".to_string()));
         // 非 USE 或不支持的形式 → None
         assert_eq!(use_db_name("SELECT 1"), None);
         assert_eq!(use_db_name("USE"), None);
-        assert_eq!(use_db_name("USE `my db`"), None);
         assert_eq!(use_db_name("USE a b"), None);
+        assert_eq!(use_db_name("USE a, b"), None);
+        assert_eq!(use_db_name("USE 1"), None);
+        assert_eq!(use_db_name("USE `my db` SELECT 1"), None);
+        assert_eq!(use_db_name(""), None);
     }
 
     #[test]
@@ -1855,6 +2434,8 @@ mod tests {
         assert!(is_text_prepare("prepare s FROM 'SELECT ?'"));
         assert!(is_text_prepare("  Prepare\ns FROM 'SELECT 1'"));
         assert!(is_text_prepare("PREPARE s FROM 'x'"));
+        // 前导注释也能识别(token 定位)
+        assert!(is_text_prepare("-- comment\nPREPARE s FROM 'x'"));
 
         // 不命中
         assert!(!is_text_prepare("SELECT * FROM t"));
@@ -1862,7 +2443,7 @@ mod tests {
         assert!(!is_text_prepare(""));
         assert!(!is_text_prepare("EXECUTE s"));
         assert!(!is_text_prepare("DEALLOCATE PREPARE s"));
-        assert!(!is_text_prepare("-- comment\nPREPARE s FROM 'x'")); // 前导注释不识别(已知边界)
+        assert!(!is_text_prepare("/* hint */ SELECT 1"));
     }
 }
 

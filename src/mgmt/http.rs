@@ -252,6 +252,8 @@ fn route(
         ("GET", "/api/backenderrors") => (200, "application/json", api_backend_errors(ctx)),
         ("GET", "/api/pool") => (200, "application/json", api_pool(ctx)),
         ("GET", "/api/config") => (200, "application/json", api_config(ctx)),
+        ("GET", "/api/ha") => (200, "application/json", api_ha(ctx)),
+        ("POST", "/api/ha/reprobe") => api_ha_reprobe(ctx, query),
         ("POST", "/api/kill") => api_kill(ctx, query),
         ("POST", "/api/reload") => api_reload(ctx),
         ("GET", "/favicon.ico") => (404, "text/plain", "not found".to_string()),
@@ -479,6 +481,9 @@ fn api_status(ctx: &AppCtx) -> String {
             "parse": s.stage_parse_us / q,
             "setup": s.stage_setup_us / q,
             "send": s.stage_send_us / q,
+            "exec": s.stage_exec_us / q,
+            "recv": s.stage_recv_us / q,
+            "cli_send": s.stage_cli_send_us / q,
             "forward": s.stage_forward_us / q,
         },
         "shards": ctx
@@ -502,7 +507,10 @@ fn api_status(ctx: &AppCtx) -> String {
                         "parse": a[1] / q,
                         "setup": a[2] / q,
                         "send": a[3] / q,
-                        "forward": a[4] / q,
+                        "exec": a[4] / q,
+                        "recv": a[5] / q,
+                        "cli_send": a[6] / q,
+                        "forward": a[7] / q,
                     }
                 })
             })
@@ -539,6 +547,21 @@ fn api_status(ctx: &AppCtx) -> String {
                 })
             })
             .collect::<Vec<_>>(),
+        // 主库读分布(SELECT 发往主库的原因 × 用户计数,按次数降序;
+        // 面板"主库读分布"表数据源。原因见 metric.rs::leader_read_counts 注释)
+        "leader_reads": ctx
+            .metrics
+            .leader_reads_snapshot()
+            .into_iter()
+            .map(|((user, reason), count)| {
+                json!({
+                    "user": user,
+                    "reason": reason,
+                    "count": count,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "leader_reads_total": ctx.metrics.leader_reads_total.get(),
         "process": process,
     })
     .to_string()
@@ -632,7 +655,11 @@ fn api_recent(ctx: &AppCtx, query: &str) -> String {
                 "parse_us": q.parse_us,
                 "setup_us": q.setup_us,
                 "send_us": q.send_us,
+                "exec_us": q.exec_us,
+                "recv_us": q.recv_us,
+                "cli_send_us": q.cli_send_us,
                 "forward_us": q.forward_us,
+                "route": q.route,
             })
         })
         .collect();
@@ -665,7 +692,11 @@ fn api_slow(ctx: &AppCtx, query: &str) -> String {
                 "parse_us": q.parse_us,
                 "setup_us": q.setup_us,
                 "send_us": q.send_us,
+                "exec_us": q.exec_us,
+                "recv_us": q.recv_us,
+                "cli_send_us": q.cli_send_us,
                 "forward_us": q.forward_us,
+                "route": q.route,
             })
         })
         .collect();
@@ -798,6 +829,83 @@ fn api_config(ctx: &AppCtx) -> String {
     .to_string()
 }
 
+/// `GET /api/ha`:每个受管分片的 xenon raft 运行时状态 + 配置档位
+fn api_ha(ctx: &AppCtx) -> String {
+    let cfg = ctx.load_config();
+    let mut arr: Vec<serde_json::Value> = Vec::new();
+    for c in cfg.clusters.values() {
+        for t in &c.tablets {
+            let Some(x) = &t.xenon else { continue };
+            let st = ctx.ha.snapshot(&c.id, &t.tablet_id);
+            let db_ov: std::collections::HashMap<String, String> = x
+                .db_overrides
+                .iter()
+                .map(|(k, v)| (k.clone(), format!("{v}")))
+                .collect();
+            let user_ov: std::collections::HashMap<String, String> = x
+                .user_overrides
+                .iter()
+                .map(|(k, v)| (k.clone(), format!("{v}")))
+                .collect();
+            let mut j = json!({
+                "cluster_id": c.id,
+                "cluster_name": c.name,
+                "tablet_id": t.tablet_id,
+                "members": x.members.iter().map(|m| m.endpoint()).collect::<Vec<_>>(),
+                "read_consistency": format!("{}", x.read_consistency),
+                "db_overrides": db_ov,
+                "user_overrides": user_ov,
+                "probe_interval_ms": x.probe_interval_ms,
+                "leader_stale_ms": x.leader_stale_ms,
+            });
+            if let Some(st) = st {
+                let o = j.as_object_mut().expect("object");
+                o.insert("leader".into(), json!(st.leader.as_ref().map(|a| a.endpoint())));
+                o.insert(
+                    "followers".into(),
+                    json!(st.followers.iter().map(|a| a.endpoint()).collect::<Vec<_>>()),
+                );
+                o.insert("view_id".into(), json!(st.view_id));
+                o.insert("epoch_id".into(), json!(st.epoch_id));
+                o.insert("updated_at_ms".into(), json!(st.updated_at_ms));
+                o.insert("last_ok_ms".into(), json!(st.last_ok_ms));
+                o.insert("degraded".into(), json!(st.degraded));
+                o.insert("semisync_on".into(), json!(st.semisync_on));
+                o.insert("last_change_ms".into(), json!(st.last_change_ms));
+                o.insert("last_probe_errors".into(), json!(st.last_probe_errors));
+            }
+            arr.push(j);
+        }
+    }
+    serde_json::json!({ "managed": arr }).to_string()
+}
+
+/// `POST /api/ha/reprobe?cluster=..&tablet=..`(缺省对全部受管分片):排队重探
+fn api_ha_reprobe(ctx: &AppCtx, query: &str) -> (u16, &'static str, String) {
+    let mut cid = query.split('&').find_map(|kv| kv.strip_prefix("cluster=")).unwrap_or("");
+    let mut tid = query.split('&').find_map(|kv| kv.strip_prefix("tablet=")).unwrap_or("");
+    if cid.is_empty() || tid.is_empty() {
+        // 全部受管分片
+        let cfg = ctx.load_config();
+        for c in cfg.clusters.values() {
+            for t in &c.tablets {
+                if t.xenon.is_some() {
+                    ctx.ha.request_reprobe(&c.id, &t.tablet_id);
+                }
+            }
+        }
+        cid = "*";
+        tid = "*";
+    } else {
+        ctx.ha.request_reprobe(cid, tid);
+    }
+    (
+        200,
+        "application/json",
+        json!({ "ok": true, "cluster": cid, "tablet": tid }).to_string(),
+    )
+}
+
 fn api_kill(ctx: &AppCtx, query: &str) -> (u16, &'static str, String) {
     let cid: u32 = query
         .split('&')
@@ -923,6 +1031,42 @@ fn render_metrics(ctx: &AppCtx) -> String {
             "newproxy_process_cpu_percent {:.2}\n",
             meter.cpu_percent().unwrap_or(f64::NAN)
         ));
+    push_counter(
+        &mut out,
+        "newproxy_ha_probe_errors_total",
+        "Xenon raft HA probe errors",
+        ctx.metrics.ha_probe_errors.get(),
+    );
+    push_counter(
+        &mut out,
+        "newproxy_ha_leader_changes_total",
+        "Xenon raft leader changes applied",
+        ctx.metrics.ha_leader_changes.get(),
+    );
+    push_counter(
+        &mut out,
+        "newproxy_ha_semisync_degrade_events_total",
+        "Semi-sync degraded to async events",
+        ctx.metrics.ha_semisync_degrade_events.get(),
+    );
+    push_counter(
+        &mut out,
+        "newproxy_ha_reads_follower_total",
+        "Reads served by raft followers",
+        ctx.metrics.ha_reads_follower.get(),
+    );
+    push_counter(
+        &mut out,
+        "newproxy_ha_reads_leader_fallback_total",
+        "Reads falling back to leader (barrier/unavailable)",
+        ctx.metrics.ha_reads_leader_fallback.get(),
+    );
+    push_counter(
+        &mut out,
+        "newproxy_ha_barrier_timeouts_total",
+        "GTID barrier waits exceeding budget",
+        ctx.metrics.ha_barrier_timeouts.get(),
+    );
         out.push_str("# HELP newproxy_process_memory_bytes Process RSS memory bytes\n# TYPE newproxy_process_memory_bytes gauge\n");
         out.push_str(&format!(
             "newproxy_process_memory_bytes {}\n",
@@ -992,11 +1136,35 @@ fn render_metrics(ctx: &AppCtx) -> String {
         ));
     }
 
-    // ── 分片维度:查询数 / 5 阶段耗时合计 / 慢查询数(与 /api/status 同源)──
+    // ── 查询阶段平均耗时(全局 8 段;平均 = 累计/查询数,µs → 秒)──
+    // exec=后端执行等待(发命令→后端首包), recv=收后端响应包, cli_send=发客户端;
+    // forward=后端执行+转发合计(exec+recv+cli_send,兼容旧口径)
+    {
+        let q = s.queries_total.max(1);
+        let stages: [(&str, u64); 8] = [
+            ("interval", s.stage_interval_us / q),
+            ("parse", s.stage_parse_us / q),
+            ("setup", s.stage_setup_us / q),
+            ("send", s.stage_send_us / q),
+            ("exec", s.stage_exec_us / q),
+            ("recv", s.stage_recv_us / q),
+            ("cli_send", s.stage_cli_send_us / q),
+            ("forward", s.stage_forward_us / q),
+        ];
+        out.push_str("# HELP newproxy_query_stage_seconds Query average duration per stage (cumulative / queries)\n# TYPE newproxy_query_stage_seconds gauge\n");
+        for (name, avg_us) in stages {
+            out.push_str(&format!(
+                "newproxy_query_stage_seconds{{stage=\"{name}\"}} {:.6}\n",
+                avg_us as f64 / 1e6
+            ));
+        }
+    }
+
+    // ── 分片维度:查询数 / 8 段耗时合计 / 慢查询数(与 /api/status 同源)──
     out.push_str(
         "# HELP newproxy_shard_queries_total Queries per shard\n# TYPE newproxy_shard_queries_total counter\n",
     );
-    out.push_str("# HELP newproxy_shard_duration_seconds_total Cumulative 5-stage duration per shard\n# TYPE newproxy_shard_duration_seconds_total counter\n");
+    out.push_str("# HELP newproxy_shard_duration_seconds_total Cumulative 8-stage duration per shard (interval/parse/setup/send/exec/recv/cli_send + forward=exec+recv+cli_send)\n# TYPE newproxy_shard_duration_seconds_total counter\n");
     for (shard, qn, stages) in m.shard_stages_snapshot() {
         let slabel = prom_label(&shard);
         let dur_us: u64 = stages.iter().sum();
@@ -1045,6 +1213,22 @@ fn render_metrics(ctx: &AppCtx) -> String {
             a[1]
         ));
     }
+
+    // ── 主库读路由标识(SELECT 发往主库的原因 × 用户;总计数见 leader_reads_total)──
+    out.push_str("# HELP newproxy_leader_reads_total SELECT queries routed to leader with reason (user x reason)\n# TYPE newproxy_leader_reads_total counter\n");
+    for ((user, reason), count) in m.leader_reads_snapshot() {
+        let u = prom_label(&user);
+        let r = prom_label(&reason);
+        out.push_str(&format!(
+            "newproxy_leader_reads_total{{user=\"{u}\",reason=\"{r}\"}} {count}\n"
+        ));
+    }
+    push_counter(
+        &mut out,
+        "newproxy_leader_reads_total",
+        "Total SELECT queries routed to leader (all reasons)",
+        m.leader_reads_total.get(),
+    );
 
     // ── 后端错误按错误码拆分(总计数已在上方输出;此处明细与总计数一致)──
     for (code, st) in m.backend_error_stats_snapshot() {
@@ -1183,9 +1367,14 @@ mod tests {
         let m = &ctx.metrics;
         m.record_query("SELECT * FROM users WHERE id = ?", "0.t0", 500, 3, 200_000);
         m.record_query("SELECT SLEEP(?)", "0.t0", 2_000_000, 0, 200_000);
-        m.record_query_stages("0.t0", 10, 20, 30, 40, 50);
+        // 8 段:interval, parse, setup, send, exec, recv, cli_send, forward(=exec+recv+cli_send)
+        m.record_query_stages("0.t0", 10, 20, 30, 40, 100, 50, 25, 175);
         m.record_parse_failure("命令包解析失败", "SELEC\u{fffd}T");
         m.record_backend_error("1064", "SELEC * FROM t");
+        m.record_leader_read("u", "in-transaction");
+        m.record_leader_read("u", "in-transaction");
+        m.record_leader_read("u", "session-pinned");
+        m.record_leader_read("other", "level-strong");
         m.record_recent_query(crate::metric::QueryRecord {
             ts: 1,
             sql: "SELECT 1".into(),
@@ -1198,7 +1387,11 @@ mod tests {
             parse_us: 0,
             setup_us: 0,
             send_us: 0,
+            exec_us: 0,
+            recv_us: 0,
+            cli_send_us: 0,
             forward_us: 0,
+            route: Some("in-transaction".into()),
         });
         m.record_slow_query(crate::metric::SlowQuery {
             ts: 2,
@@ -1211,7 +1404,11 @@ mod tests {
             parse_us: 0,
             setup_us: 0,
             send_us: 0,
+            exec_us: 0,
+            recv_us: 0,
+            cli_send_us: 0,
             forward_us: 0,
+            route: Some("in-transaction".into()),
         });
     }
 
@@ -1239,6 +1436,14 @@ mod tests {
         assert!(body.contains("\"0.t0\""), "got: {body}");
         assert!(body.contains("\"shard_stages\""), "got: {body}");
         assert!(body.contains("\"stage_avg_us\""), "got: {body}");
+        // 8 段阶段分解新字段
+        assert!(body.contains("\"exec\":"), "got: {body}");
+        assert!(body.contains("\"recv\":"), "got: {body}");
+        assert!(body.contains("\"cli_send\":"), "got: {body}");
+        // 主库读分布(populate: in-transaction×2, session-pinned×1, level-strong×1)
+        assert!(body.contains("\"leader_reads\""), "got: {body}");
+        assert!(body.contains("\"leader_reads_total\":4"), "got: {body}");
+        assert!(body.contains("\"reason\":\"in-transaction\""), "got: {body}");
         assert!(body.contains("\"process\""), "got: {body}");
     }
 
@@ -1365,6 +1570,23 @@ mod tests {
             "got: {out}"
         );
         assert!(out.contains("newproxy_process_uptime_seconds"), "got: {out}");
+        // 阶段平均耗时 gauge(8 段;populate: exec=100µs/2条=50µs=0.00005s)
+        assert!(
+            out.contains("newproxy_query_stage_seconds{stage=\"exec\"} 0.000050"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("newproxy_query_stage_seconds{stage=\"cli_send\"}"),
+            "got: {out}"
+        );
+        // 主库读路由标识(按 用户×原因 计数 + 总数)
+        assert!(
+            out.contains(
+                "newproxy_leader_reads_total{user=\"u\",reason=\"in-transaction\"} 2"
+            ),
+            "got: {out}"
+        );
+        assert!(out.contains("newproxy_leader_reads_total 4"), "got: {out}");
         // 慢查询 HELP 不再写死 1s(阈值来自配置 slow_query_ms)
         assert!(!out.contains("Slow queries (>1s)"), "got: {out}");
     }

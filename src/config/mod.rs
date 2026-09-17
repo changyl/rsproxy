@@ -5,5 +5,6 @@ pub mod model;
 pub use loader::{load_config, ConfigError};
 pub use model::{
     AppConfig, Cluster, ClusterId, ClusterTablet, ConfigCenterCfg, Database, DatabaseGroup, DbUser,
-    GroupId, LogLevel, MasterSlave, ProductUser, RouteRule, ShardStrategy, TabletId, UserId,
+    GroupId, LogLevel, MasterSlave, ProductUser, RaftMember, ReadConsistency, RouteRule,
+    ShardStrategy, TabletId, UserId, XenonRaft,
 };

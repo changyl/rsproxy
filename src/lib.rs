@@ -2,6 +2,7 @@ pub mod app;
 pub mod config;
 pub mod config_center;
 pub mod conn;
+pub mod ha;
 pub mod limit;
 pub mod logging;
 pub mod metric;

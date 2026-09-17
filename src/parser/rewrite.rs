@@ -388,8 +388,9 @@ mod tests {
 /// 执行计划绑定:SQL 模板命中则注入优化器 hint,使后端走固定执行计划。
 ///
 /// - 匹配:大小写不敏感**子串**匹配(规则 sql_pattern)
-/// - 注入:首个语句关键字(SELECT/INSERT/UPDATE/DELETE/REPLACE)之后插入 hint,
-///   形如 `SELECT /*+ INDEX(t idx) */ ...`(MySQL 优化器 hint 语法)
+/// - 注入:首个**词法意义上的**语句关键字(SELECT/INSERT/UPDATE/DELETE/REPLACE)
+///   token 之后插入 hint,形如 `SELECT /*+ INDEX(t idx) */ ...`
+///   (token 定位 ⇒ 前导注释/字符串/标识符内的关键字不会误命中)
 /// - 无绑定规则或未命中返回 None(零改写,透传原样)
 pub fn apply_plan_binding(
     sql: &str,
@@ -404,24 +405,21 @@ pub fn apply_plan_binding(
         !pat.is_empty() && lower.contains(&pat)
     })?;
 
-    // 定位首个语句关键字(注释/大小写边缘情况从简,取最小出现位置)
+    // 定位首个 DML 关键字 token(注释/字符串/标识符中的关键字天然排除)
     const KEYWORDS: [&str; 5] = ["select", "insert", "update", "delete", "replace"];
-    let mut best: Option<(usize, usize)> = None;
-    for k in KEYWORDS {
-        if let Some(p) = lower.find(k) {
-            if best.map_or(true, |(bp, _)| p < bp) {
-                best = Some((p, k.len()));
-            }
-        }
-    }
-    let (kw_pos, kw_len) = best?;
+    let (toks, _) = crate::parser::lex::tokenize(sql);
+    let kw = toks.iter().find(|t| {
+        t.kind == crate::parser::lex::TokenKind::Word
+            && KEYWORDS.iter().any(|k| crate::parser::lex::eq_ignore_ascii_case(t.text(sql), k))
+    })?;
+    let kw_end = kw.end;
 
     let mut out = String::with_capacity(sql.len() + rule.hint.len() + 3);
-    out.push_str(&sql[..kw_pos + kw_len]);
+    out.push_str(&sql[..kw_end]);
     out.push(' ');
     out.push_str(&rule.hint);
     // 关键字后原文已有空白(如 "UPDATE orders")则不再补空格,避免双空格
-    let rest = &sql[kw_pos + kw_len..];
+    let rest = &sql[kw_end..];
     if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace()) {
         out.push(' ');
     }
@@ -482,118 +480,32 @@ mod binding_tests {
 
 // ─── SQL 模板归一化(字面量 → ?)───
 
-/// 把 SQL 中的字面量(数字、单双引号字符串)替换为 `?`,得到模板。
+/// 把 SQL 中的字面量(数字、十六进制、单双引号字符串)替换为 `?`,得到模板。
 ///
 /// 用途:Top SQL 按模板聚合(如 `SELECT * FROM t WHERE id=?`),
 /// 而非按具体 SQL(带字面量)统计,避免同一条语句因参数不同被拆成多条。
-/// 注释保留(不影响执行);转义引号(\\')正确处理。
+///
+/// 基于词法器实现:只替换 Str/Num token,其余文本(含注释/空白/大小写/
+/// 标识符内数字如 `t1`)逐字节原样保留;转义引号(`it\'s`)由词法器正确识别。
+/// 相对旧字符游标实现的行为修复:十六进制 `0xFF` → `?`(旧:`?xFF`),
+/// 标识符内数字不再被替换(旧会把 `t1` 变 `t?`),`--` 注释识别与 MySQL 一致。
 pub fn normalize_sql(sql: &str) -> String {
-    let bytes = sql.as_bytes();
+    use crate::parser::lex::{self, TokenKind};
+    let (toks, _) = lex::tokenize(sql);
     let mut out = String::with_capacity(sql.len());
-    let mut i = 0;
-    let mut in_squote = false;
-    let mut in_dquote = false;
-    let mut in_line_comment = false;
-    let mut in_block_comment = false;
-    let mut in_number = false;
-
-    while i < bytes.len() {
-        let c = bytes[i];
-        // 行注释
-        if in_line_comment {
-            out.push(c as char);
-            if c == b'\n' {
-                in_line_comment = false;
-            }
-            i += 1;
-            continue;
-        }
-        // 块注释
-        if in_block_comment {
-            out.push(c as char);
-            if c == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                out.push('/');
-                i += 2;
-                in_block_comment = false;
-            } else {
-                i += 1;
-            }
-            continue;
-        }
-        // 单引号字符串
-        if in_squote {
+    let mut prev_end = 0usize;
+    for t in &toks {
+        if matches!(t.kind, TokenKind::Str | TokenKind::Num) {
+            // 保留字面量之前原文,把字面量替换为 `?`
+            out.push_str(&sql[prev_end..t.start]);
             out.push('?');
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2; // 转义
-                    continue;
-                }
-                if bytes[i] == b'\'' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            in_squote = false;
-            continue;
-        }
-        // 双引号字符串(标识符可加双引号;此处按字符串替换,兼容多数场景)
-        if in_dquote {
-            out.push('?');
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
-                    continue;
-                }
-                if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            in_dquote = false;
-            continue;
-        }
-
-        match c {
-            b'\'' => {
-                in_squote = true;
-                i += 1;
-            }
-            b'"' => {
-                in_dquote = true;
-                i += 1;
-            }
-            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
-                in_line_comment = true;
-                out.push_str("--");
-                i += 2;
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                in_block_comment = true;
-                out.push_str("/*");
-                i += 2;
-            }
-            b'0'..=b'9' => {
-                if !in_number {
-                    out.push('?');
-                    in_number = true;
-                }
-                i += 1;
-            }
-            b'.' if in_number => {
-                i += 1; // 小数部分并入同一 ?
-            }
-            _ => {
-                in_number = false;
-                out.push(c as char);
-                i += 1;
-            }
+            prev_end = t.end;
         }
     }
+    // 末尾(最后一个字面量之后)原文
+    out.push_str(&sql[prev_end..]);
     out
 }
-
 #[cfg(test)]
 mod normalize_tests {
     use super::normalize_sql;

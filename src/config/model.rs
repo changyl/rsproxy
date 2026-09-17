@@ -95,6 +95,108 @@ pub struct DatabaseGroup {
     pub slave: Option<Database>,
 }
 
+// ─── Xenon Raft 高可用(XenonRaft 段)───
+
+/// 读一致性档位(只作用于"可分流纯读";详见 ha/consistency 与文档)。
+///
+/// 语义承诺由强到弱:
+/// - `Strong`(内置默认):全走 raft leader(线性化),零额外成本;
+/// - `Causal`:高水位 GTID 屏障读,满足跨客户端因果(读 = 主库某提交前缀);
+/// - `Session`:会话水位屏障,读己之写 + 本会话单调读(不约束其它客户端);
+/// - `Eventual`:免屏障直读 follower,允许任意滞后/乱序(业务自担)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ReadConsistency {
+    #[default]
+    Strong,
+    Causal,
+    Session,
+    Eventual,
+}
+
+impl ReadConsistency {
+    /// 大小写不敏感解析;未知返回 None。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "strong" => Some(ReadConsistency::Strong),
+            "causal" => Some(ReadConsistency::Causal),
+            "session" => Some(ReadConsistency::Session),
+            "eventual" => Some(ReadConsistency::Eventual),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ReadConsistency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            ReadConsistency::Strong => "strong",
+            ReadConsistency::Causal => "causal",
+            ReadConsistency::Session => "session",
+            ReadConsistency::Eventual => "eventual",
+        };
+        write!(f, "{s}")
+    }
+}
+
+/// Xenon raft 成员(一个成员 = 一台部署了 xenon 且其 MySQL 为同一数据集的节点)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftMember {
+    /// MySQL 主机(xenon 与 MySQL 同机部署时的 raft 端点主机)
+    pub host: String,
+    /// 该成员 MySQL 端口
+    pub mysql_port: u16,
+    /// xenon raft 端点(形如 `xenon1:8801`),用于对齐状态表 `leader` 列
+    pub raft_endpoint: Option<String>,
+}
+
+impl RaftMember {
+    pub fn endpoint(&self) -> String {
+        format!("{}:{}", self.host, self.mysql_port)
+    }
+}
+
+/// 分片级 Xenon raft 管理配置(`[XenonRaft_<cluster>_<tablet>]` 段)。
+///
+/// 提供:成员列表(探测目标 + follower 来源)、探测节奏、一致性档位默认与
+/// 库/用户覆盖、GTID 屏障参数。
+#[derive(Debug, Clone)]
+pub struct XenonRaft {
+    /// raft 全量成员(探测与 follower 池的来源)
+    pub members: Vec<RaftMember>,
+    /// 状态表探测周期(ms)
+    pub probe_interval_ms: u64,
+    /// 单成员探测超时(ms)
+    pub probe_timeout_ms: u64,
+    /// 状态行允许的最长新鲜度(ms);超过视为无效
+    pub leader_stale_ms: u64,
+    /// 分片默认读一致性档位
+    pub read_consistency: ReadConsistency,
+    /// 库级覆盖:db 名(小写)→ 档位
+    pub db_overrides: HashMap<String, ReadConsistency>,
+    /// 产品用户级覆盖:用户名 → 档位
+    pub user_overrides: HashMap<String, ReadConsistency>,
+    /// WAIT_FOR_EXECUTED_GTID_SET 预算(ms)
+    pub barrier_wait_ms: u64,
+    /// leader @@GLOBAL.gtid_executed 采样缓存(ms)
+    pub gtid_sample_cache_ms: u64,
+}
+
+impl Default for XenonRaft {
+    fn default() -> Self {
+        Self {
+            members: Vec::new(),
+            probe_interval_ms: 1000,
+            probe_timeout_ms: 500,
+            leader_stale_ms: 3000,
+            read_consistency: ReadConsistency::Strong,
+            db_overrides: HashMap::new(),
+            user_overrides: HashMap::new(),
+            barrier_wait_ms: 200,
+            gtid_sample_cache_ms: 30,
+        }
+    }
+}
+
 // ─── 分片(ClusterTablet) ───
 
 /// 分片(对应 C tr_cluster_tablet_t)
@@ -108,6 +210,8 @@ pub struct ClusterTablet {
     pub groups: Vec<DatabaseGroup>,
     /// 路由规则
     pub routes: Vec<RouteRule>,
+    /// Xenon raft 管理配置(无 = 静态主从,现状行为)
+    pub xenon: Option<XenonRaft>,
 }
 
 // ─── 集群 ───
@@ -366,5 +470,34 @@ mod tests {
         assert!(cfg.clusters.is_empty());
         assert!(cfg.plan_bindings.is_empty());
         assert_eq!(cfg.slow_query_ms, 200);
+    }
+
+    #[test]
+    fn read_consistency_parse_display() {
+        assert_eq!(ReadConsistency::default(), ReadConsistency::Strong);
+        assert_eq!(ReadConsistency::parse("strong"), Some(ReadConsistency::Strong));
+        assert_eq!(ReadConsistency::parse("STRONG"), Some(ReadConsistency::Strong));
+        assert_eq!(ReadConsistency::parse("causal"), Some(ReadConsistency::Causal));
+        assert_eq!(ReadConsistency::parse("Session"), Some(ReadConsistency::Session));
+        assert_eq!(ReadConsistency::parse("eventual"), Some(ReadConsistency::Eventual));
+        assert_eq!(ReadConsistency::parse(" bogus "), None);
+        assert_eq!(ReadConsistency::Causal.to_string(), "causal");
+        assert_eq!(ReadConsistency::Eventual.to_string(), "eventual");
+    }
+
+    #[test]
+    fn xenon_raft_defaults_sane() {
+        let x = XenonRaft::default();
+        assert!(x.members.is_empty());
+        assert_eq!(x.probe_interval_ms, 1000);
+        assert_eq!(x.read_consistency, ReadConsistency::Strong);
+        assert!(x.db_overrides.is_empty() && x.user_overrides.is_empty());
+        assert!(x.members.is_empty());
+        let m = RaftMember {
+            host: "xenon1".into(),
+            mysql_port: 3306,
+            raft_endpoint: Some("xenon1:8801".into()),
+        };
+        assert_eq!(m.endpoint(), "xenon1:3306");
     }
 }

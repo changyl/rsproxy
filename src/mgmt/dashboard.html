@@ -249,7 +249,19 @@
       <div class="v" id="st-send">-</div>
     </div>
     <div class="card">
-      <div class="k">平均耗时·后端执行+转发(µs)</div>
+      <div class="k">平均耗时·后端执行等待(µs)</div>
+      <div class="v" id="st-exec">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·收后端包(µs)</div>
+      <div class="v" id="st-recv">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·发客户端(µs)</div>
+      <div class="v" id="st-cli-send">-</div>
+    </div>
+    <div class="card">
+      <div class="k">平均耗时·后端执行+转发合计(µs)</div>
       <div class="v" id="st-forward">-</div>
     </div>
   </div>
@@ -275,7 +287,7 @@
   </div>
 
   <section class="panel">
-    <h2>分片阶段耗时<span class="sub">（各分片平均 5 阶段耗时 µs，查询数来自分片计数，2s 自动刷新）</span></h2>
+    <h2>分片阶段耗时<span class="sub">（各分片平均 8 段耗时 µs，查询数来自分片计数，2s 自动刷新）</span></h2>
     <table id="shard-stage-table">
       <thead>
         <tr>
@@ -285,12 +297,15 @@
           <th>解析(µs)</th>
           <th>后端准备(µs)</th>
           <th>发送(µs)</th>
-          <th>后端执行+转发(µs)</th>
+          <th>后端执行等待(µs)</th>
+          <th>收后端包(µs)</th>
+          <th>发客户端(µs)</th>
+          <th>执行+转发合计(µs)</th>
         </tr>
       </thead>
       <tbody>
         <tr>
-          <td colspan="7" class="empty">加载中…</td>
+          <td colspan="10" class="empty">加载中…</td>
         </tr>
       </tbody>
     </table>
@@ -387,13 +402,20 @@
                 class="sort-ind"></span></th>
             <th class="sortable" data-k="send_us" onclick="sortRecent('send_us')">发送(µs)<span class="sort-ind"></span>
             </th>
-            <th class="sortable" data-k="forward_us" onclick="sortRecent('forward_us')">后端执行+转发(µs)<span
+            <th class="sortable" data-k="exec_us" onclick="sortRecent('exec_us')">后端执行等待(µs)<span
                 class="sort-ind"></span></th>
+            <th class="sortable" data-k="recv_us" onclick="sortRecent('recv_us')">收后端包(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="cli_send_us" onclick="sortRecent('cli_send_us')">发客户端(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="forward_us" onclick="sortRecent('forward_us')">执行+转发合计(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="route" onclick="sortRecent('route')">路由<span class="sort-ind"></span></th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td colspan="12" class="empty">加载中…</td>
+            <td colspan="16" class="empty">加载中…</td>
           </tr>
         </tbody>
       </table>
@@ -438,13 +460,20 @@
             </th>
             <th class="sortable" data-k="send_us" onclick="sortSlow('send_us')">发送(µs)<span class="sort-ind"></span>
             </th>
-            <th class="sortable" data-k="forward_us" onclick="sortSlow('forward_us')">后端执行+转发(µs)<span
+            <th class="sortable" data-k="exec_us" onclick="sortSlow('exec_us')">后端执行等待(µs)<span
                 class="sort-ind"></span></th>
+            <th class="sortable" data-k="recv_us" onclick="sortSlow('recv_us')">收后端包(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="cli_send_us" onclick="sortSlow('cli_send_us')">发客户端(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="forward_us" onclick="sortSlow('forward_us')">执行+转发合计(µs)<span
+                class="sort-ind"></span></th>
+            <th class="sortable" data-k="route" onclick="sortSlow('route')">路由<span class="sort-ind"></span></th>
           </tr>
         </thead>
         <tbody>
           <tr>
-            <td colspan="11" class="empty">加载中…</td>
+            <td colspan="15" class="empty">加载中…</td>
           </tr>
         </tbody>
       </table>
@@ -492,6 +521,32 @@
       </table>
     </div>
     <div id="be-pager" style="padding:8px 12px;border-top:1px solid var(--border);"></div>
+  </section>
+
+  <section class="panel">
+    <h2>主库读分布<span class="sub">（SELECT 发往主库的原因 × 用户 计数，2s 自动刷新；原因见下方说明）</span></h2>
+    <table id="leader-reads-table">
+      <thead>
+        <tr>
+          <th>用户</th>
+          <th>原因</th>
+          <th>次数</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td colspan="3" class="empty">加载中…</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="color:var(--muted);font-size:11px;margin:6px 12px 10px;">
+      原因对照：in-transaction=显式事务内 · session-pinned=会话被 pin(SET/临时表/prepared/autocommit=0) ·
+      level-strong=一致性档位 strong 或未启用分流 · for-update-share=FOR UPDATE/SHARE ·
+      lock-in-share=LOCK IN SHARE MODE · select-into=SELECT INTO · procedure-analyse=PROCEDURE ANALYSE ·
+      found-rows-prefix=SQL_CALC_FOUND_ROWS · user-variable=用户/系统变量 ·
+      session-function=会话函数(LAST_INSERT_ID/GET_LOCK/SLEEP 等) ·
+      no-statement/multi-statement=空语句/多语句 · follower-fallback=从库不可用或追不平降级主库
+    </p>
   </section>
 
   <section class="panel">
@@ -624,7 +679,11 @@
       document.getElementById("st-parse").textContent = st.parse ?? "-";
       document.getElementById("st-setup").textContent = st.setup ?? "-";
       document.getElementById("st-send").textContent = st.send ?? "-";
+      document.getElementById("st-exec").textContent = st.exec ?? "-";
+      document.getElementById("st-recv").textContent = st.recv ?? "-";
+      document.getElementById("st-cli-send").textContent = st.cli_send ?? "-";
       document.getElementById("st-forward").textContent = st.forward ?? "-";
+      renderLeaderReads(s.leader_reads);
       hist.ts.push(Date.now());
       hist.qps.push(qps); hist.conn.push(s.connections_active);
       hist.lat.push(prevLatAvg || 0);
@@ -649,7 +708,7 @@
       if (!tbody) return;
       tbody.innerHTML = "";
       if (!list || !list.length) {
-        tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无分片耗时数据</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" class="empty">暂无分片耗时数据</td></tr>';
         return;
       }
       for (const x of list) {
@@ -661,7 +720,28 @@
         tr.appendChild(el("td", "mono", a.parse ?? "-"));
         tr.appendChild(el("td", "mono", a.setup ?? "-"));
         tr.appendChild(el("td", "mono", a.send ?? "-"));
+        tr.appendChild(el("td", "mono", a.exec ?? "-"));
+        tr.appendChild(el("td", "mono", a.recv ?? "-"));
+        tr.appendChild(el("td", "mono", a.cli_send ?? "-"));
         tr.appendChild(el("td", "mono", a.forward ?? "-"));
+        tbody.appendChild(tr);
+      }
+    }
+
+    // ─── 主库读分布表(来自 /api/status → leader_reads)───
+    function renderLeaderReads(list) {
+      const tbody = document.querySelector("#leader-reads-table tbody");
+      if (!tbody) return;
+      tbody.innerHTML = "";
+      if (!list || !list.length) {
+        tbody.innerHTML = '<tr><td colspan="3" class="empty">暂无主库读（未启用分流或全部 SELECT 均走从库）</td></tr>';
+        return;
+      }
+      for (const x of list) {
+        const tr = el("tr");
+        tr.appendChild(el("td", "mono", x.user || "-"));
+        tr.appendChild(el("td", "", x.reason || "-"));
+        tr.appendChild(el("td", "mono", x.count));
         tbody.appendChild(tr);
       }
     }
@@ -955,7 +1035,11 @@
         tr.appendChild(el("td", "mono", q.parse_us));
         tr.appendChild(el("td", "mono", q.setup_us));
         tr.appendChild(el("td", "mono", q.send_us));
+        tr.appendChild(el("td", "mono", q.exec_us));
+        tr.appendChild(el("td", "mono", q.recv_us));
+        tr.appendChild(el("td", "mono", q.cli_send_us));
         tr.appendChild(el("td", "mono", q.forward_us));
+        tr.appendChild(el("td", "mono", q.route || "-"));
         tbody.appendChild(tr);
       }
       updateRecentPager();
@@ -987,10 +1071,10 @@
         if (recentPage > Math.max(1, Math.ceil(recentList.length / PAGE_SIZE))) recentPage = 1;
         const tbody = document.querySelector("#recent-table tbody");
         if (!recentList.length) {
-          tbody.innerHTML = '<tr><td colspan="12" class="empty">' + (qs ? "无匹配查询（过滤条件生效中）— 点右上角「清除过滤」" : "暂无查询") + "</td></tr>";
+          tbody.innerHTML = '<tr><td colspan="16" class="empty">' + (qs ? "无匹配查询（过滤条件生效中）— 点右上角「清除过滤」" : "暂无查询") + "</td></tr>";
         }
         renderRecentPage();
-      } catch (e) { document.querySelector("#recent-table tbody").innerHTML = '<tr><td colspan="12" class="empty">' + e.message + "</td></tr>"; }
+      } catch (e) { document.querySelector("#recent-table tbody").innerHTML = '<tr><td colspan="16" class="empty">' + e.message + "</td></tr>"; }
     }
 
     // ─── 慢查询分页(每页 20)───
@@ -1014,7 +1098,11 @@
         tr.appendChild(el("td", "mono", q.parse_us));
         tr.appendChild(el("td", "mono", q.setup_us));
         tr.appendChild(el("td", "mono", q.send_us));
+        tr.appendChild(el("td", "mono", q.exec_us));
+        tr.appendChild(el("td", "mono", q.recv_us));
+        tr.appendChild(el("td", "mono", q.cli_send_us));
         tr.appendChild(el("td", "mono", q.forward_us));
+        tr.appendChild(el("td", "mono", q.route || "-"));
         tbody.appendChild(tr);
       }
       updateSlowPager();
@@ -1048,11 +1136,11 @@
         slowList = d.slow || [];
         if (slowPage > Math.max(1, Math.ceil(slowList.length / PAGE_SIZE))) slowPage = 1;
         if (!slowList.length) {
-          document.querySelector("#slow-table tbody").innerHTML = '<tr><td colspan="11" class="empty">' + (qs ? "无匹配慢查询（过滤条件生效中）— 点右上角「清除过滤」" : "暂无慢查询") + "</td></tr>";
+          document.querySelector("#slow-table tbody").innerHTML = '<tr><td colspan="15" class="empty">' + (qs ? "无匹配慢查询（过滤条件生效中）— 点右上角「清除过滤」" : "暂无慢查询") + "</td></tr>";
           return;
         }
         renderSlowPage();
-      } catch (e) { document.querySelector("#slow-table tbody").innerHTML = '<tr><td colspan="11" class="empty">' + e.message + "</td></tr>"; }
+      } catch (e) { document.querySelector("#slow-table tbody").innerHTML = '<tr><td colspan="15" class="empty">' + e.message + "</td></tr>"; }
     }
     async function clearSlow() {
       try {
@@ -1107,19 +1195,23 @@
       const rows = applySort(recentList, recentSort).map(q => [
         fmtDt(q.ts), q.sql, q.db || "", q.puser || "", q.shard || "",
         (q.elapsed_us / 1e6).toFixed(3), q.slow ? "是" : "否",
-        q.interval_us, q.parse_us, q.setup_us, q.send_us, q.forward_us]);
+        q.interval_us, q.parse_us, q.setup_us, q.send_us,
+        q.exec_us, q.recv_us, q.cli_send_us, q.forward_us, q.route || ""]);
       exportCsv("queries-" + dateStamp() + ".csv",
         ["时间", "SQL", "库", "用户", "分片", "总耗时(s)", "慢",
-         "间隔(µs)", "解析(µs)", "后端准备(µs)", "发送(µs)", "后端执行+转发(µs)"], rows);
+         "间隔(µs)", "解析(µs)", "后端准备(µs)", "发送(µs)",
+         "后端执行等待(µs)", "收后端包(µs)", "发客户端(µs)", "执行+转发合计(µs)", "路由"], rows);
     }
     function exportSlow() {
       const rows = applySort(slowList, slowSort).map(q => [
         fmtDt(q.ts), q.sql, q.db || "", q.puser || "", q.shard || "",
         (q.elapsed_us / 1e6).toFixed(3),
-        q.interval_us, q.parse_us, q.setup_us, q.send_us, q.forward_us]);
+        q.interval_us, q.parse_us, q.setup_us, q.send_us,
+        q.exec_us, q.recv_us, q.cli_send_us, q.forward_us, q.route || ""]);
       exportCsv("slow-" + dateStamp() + ".csv",
         ["时间", "SQL", "库", "用户", "分片", "总耗时(s)",
-         "间隔(µs)", "解析(µs)", "后端准备(µs)", "发送(µs)", "后端执行+转发(µs)"], rows);
+         "间隔(µs)", "解析(µs)", "后端准备(µs)", "发送(µs)",
+         "后端执行等待(µs)", "收后端包(µs)", "发客户端(µs)", "执行+转发合计(µs)", "路由"], rows);
     }
 
     // ─── 后端错误统计表(按错误码聚合 + 最近明细,悬停 title 显示完整 SQL)───

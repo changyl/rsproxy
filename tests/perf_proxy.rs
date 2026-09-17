@@ -654,6 +654,7 @@ async fn start_proxy(mock_port: u16) -> std::io::Result<u16> {
             slave: None,
         }],
         routes: vec![],
+        xenon: None,
     };
     let mut clusters: HashMap<String, Cluster> = HashMap::new();
     clusters.insert(

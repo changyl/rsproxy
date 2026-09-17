@@ -18,7 +18,7 @@
 | 对外通道:Prometheus 渲染、JSON API、探针、面板 | `src/mgmt/http.rs` |
 | 进程负载采样(CPU/RSS/FD,Linux `/proc`) | `src/mgmt/proc.rs` |
 | `checkproxy` 管理命令(业务端口文本) | `src/mgmt.rs` |
-| 打点现场:连接生命周期、查询 5 阶段、错误记录 | `src/conn/front.rs` |
+| 打点现场:连接生命周期、查询 8 阶段、错误记录 | `src/conn/front.rs` |
 | codec 全局包/字节收发计数(前端+后端全部 socket) | `src/proto/codec.rs` |
 | 连接注册表(cid/addr/user/db/state) | `src/app.rs` |
 | 后端连接池桶(write/read 队列深度) | `src/pool/backend.rs` |
@@ -29,11 +29,11 @@
 
 | 数据源 | 内容 | 容量/上限 |
 |---|---|---|
-| `Metrics` 原子计数器 | `connections_total / active / rejected`、`queries_total / errors / slow`、`pool_acquires / pool_acquire_fails`、5 阶段耗时累计 `stage_{interval,parse,setup,send,forward}_us` | 无界(单调累加,64 位) |
+| `Metrics` 原子计数器 | `connections_total / active / rejected`、`queries_total / errors / slow`、`pool_acquires / pool_acquire_fails`、8 段耗时累计 `stage_{interval,parse,setup,send,exec,recv,cli_send,forward}_us`(forward = exec+recv+cli_send 合计,兼容旧口径) | 无界(单调累加,64 位) |
 | `sql_stats` DashMap | SQL 模板 × 分片 → count / total_time_us / max_time_us / rows_sent | **有界 1024 条**,超限不再登记新模板 |
-| `shard_query_counts` / `shard_stage_us` | 分片查询数;分片 5 阶段耗时累计(平均 = 累计/查询数) | 随拓扑分片数 |
+| `shard_query_counts` / `shard_stage_us` | 分片查询数;分片 8 段耗时累计(平均 = 累计/查询数) | 随拓扑分片数 |
 | `db_traffic` / `node_traffic` | 按库 / 按后端节点 → [收字节, 发字节, 收包, 发包](仅**客户端方向**记账:收=命令包,发=本地应答+转发响应) | 随库数/节点数 |
-| 慢查询环形缓冲 | `SlowQuery`(ts/sql/db/puser/shard/elapsed + 5 阶段) | 有界 200 条 |
+| 慢查询环形缓冲 | `SlowQuery`(ts/sql/db/puser/shard/elapsed + 8 阶段) | 有界 200 条 |
 | 最近查询环形缓冲 | `QueryRecord`(同上 + slow 标记;**全部**查询单次阶段) | 有界 500 条 |
 | 解析失败环形缓冲 + 计数 | `ParseFailure`(ts/reason/sql 截断 512) | 有界 200 条 |
 | 后端错误(明细 + 按码聚合) | `BackendError`/`BackendErrStat`(ts/code/sql) | 有界 200 条 |
@@ -101,9 +101,9 @@ labels:`template` = 归一化 SQL(字面量 → `?`,高基数治理:≥1024 模�
 |---|---|---|
 | `connections_*` / `queries_*` | 同 §4.1 全局计数 | `queries_errors` 已与后端 ERR 同源打点(§8) |
 | `packets_received/sent` | codec 全局包计数 | 仅 JSON,未上 Prometheus |
-| `stage_avg_us{interval,parse,setup,send,forward}` | 阶段平均耗时 µs(累计/查询数) | 无直方图 → 只有平均 |
+| `stage_avg_us{interval,parse,setup,send,exec,recv,cli_send,forward}` | 阶段平均耗时 µs(累计/查询数) | 无直方图 → 只有平均 |
 | `shards[{shard,queries}]` | 分片查询数 | 未上 Prometheus |
-| `shard_stages[{shard,queries,avg_us{5 阶段}}]` | 分片阶段平均 | 未上 Prometheus |
+| `shard_stages[{shard,queries,avg_us{8 段}}]` | 分片阶段平均 | 未上 Prometheus |
 | `db_traffic[{db,recv/sent_bytes,recv/sent_pkts}]` | 按库客户端方向流量 | 未上 Prometheus |
 | `node_traffic[{node,...}]` | 按后端节点流量 | 未上 Prometheus |
 | `process{cpu_percent,memory_bytes,fd_count,connections_active}` | 进程负载 + 活跃连接 | 进程部分与 /metrics 同源 |
@@ -114,8 +114,8 @@ labels:`template` = 归一化 SQL(字面量 → `?`,高基数治理:≥1024 模�
 |---|---|
 | `GET /api/connections` | 活跃连接:cid/addr/user/db/state/backends/uptime_secs |
 | `GET /api/sql` | Top 100 SQL 模板(count/total/max/avg/rows_sent) |
-| `GET /api/slow` `?sql=&db=&user=&shard=` | 最近慢查询 ≤200 条,含 5 阶段耗时 |
-| `GET /api/recent` `?sql=&db=&user=&shard=` | 最近全部查询 ≤500 条,含单次 5 阶段 + slow 标记 |
+| `GET /api/slow` `?sql=&db=&user=&shard=` | 最近慢查询 ≤200 条,含 8 阶段耗时 |
+| `GET /api/recent` `?sql=&db=&user=&shard=` | 最近全部查询 ≤500 条,含单次 8 阶段 + slow 标记 |
 | `GET /api/parsefailures` | 最近解析失败 ≤200 条(ts/reason/sql) |
 | `GET /api/backenderrors` | 后端错误:总数 + 按码聚合 + 最近 ≤200 条 |
 | `GET /api/pool` | 每桶 cluster/tablet/user/db、write/read 队列深度、容量配置 |
@@ -176,7 +176,7 @@ labels:`template` = 归一化 SQL(字面量 → `?`,高基数治理:≥1024 模�
 | 建议指标 | 类型 | 数据源 |
 |---|---|---|
 | `newproxy_shard_queries_total{shard}` | counter | `shard_query_counts` |
-| `newproxy_shard_duration_seconds_total{shard}` | counter | `shard_stage_us`(5 阶段合计) |
+| `newproxy_shard_duration_seconds_total{shard}` | counter | `shard_stage_us`(8 段合计;forward = exec+recv+cli_send) |
 | `newproxy_db_traffic_received_bytes_total{db}` / `..._sent_bytes_total` | counter | `db_traffic` |
 | `newproxy_node_traffic_received_bytes_total{node}` / `..._sent_bytes_total` | counter | `node_traffic` |
 | `newproxy_pool_idle_connections{cluster,tablet,user,db,role}` | gauge | `SrvPool::all_buckets()` 队列深度 |
@@ -227,7 +227,7 @@ labels:`template` = 归一化 SQL(字面量 → `?`,高基数治理:≥1024 模�
 ### P1 — /metrics 补齐(渲染层与 JSON 同源)
 
 新增序列族:`newproxy_shard_queries_total{shard}`、`newproxy_shard_duration_seconds_total{shard}`
-(5 阶段合计)、`newproxy_shard_slow_queries_total{shard}`、`newproxy_db_traffic_{received,sent}_bytes_total{db}`、
+(8 段合计;forward = exec+recv+cli_send)、`newproxy_shard_slow_queries_total{shard}`、`newproxy_db_traffic_{received,sent}_bytes_total{db}`、
 `newproxy_node_traffic_{received,sent}_bytes_total{node}`、`newproxy_pool_idle_connections{cluster,tablet,user,db,role}`、
 `newproxy_connections_by_state{state}`。
 
@@ -244,7 +244,55 @@ labels:`template` = 归一化 SQL(字面量 → `?`,高基数治理:≥1024 模�
 > 未做(明确边界):`checkproxy show pool` 文本占位(#6)、限流器 `TokenBucket` 接入生产(#7)、
 > JSON 结构化日志与 trace_id(docs/13 §5)、`readyz` 深度检查——均非本文 P0-P2 范围。
 
----
+### forward 阶段精确拆分(2026-09-10)
+
+原先 5 阶段中的 `forward`(后端执行+转发)是一个黑盒,无法区分"后端执行慢"还是
+"收包/回传慢"。现将 `forward` 拆为三个独立子阶段,请求链路从 5 段扩为 **8 段**:
+
+| 阶段 | 计时窗口 | 大 → 说明 |
+|---|---|---|
+| `interval` | 上一命令结束 → 本次命令读完(**含客户端空闲**,非代理耗时) | 客户端发包慢/客户端到代理网络慢 |
+| `parse` | 解析+本地拦截 | (µs 级,异常才显眼) |
+| `setup` | 后端准备(池获取/新建握手) | 池耗尽/后端建连慢 |
+| `send` | 命令写入后端 socket | 代理→后端发送慢 |
+| **`exec`** | 命令发出 → 后端**首个**响应包到达 | **后端执行慢**(含后端网络首字节) |
+| **`recv`** | 首包后的全部后端读(含包间等待) | **后端回包慢/大结果集传输慢** |
+| **`cli_send`** | 向客户端写出的实际耗时(批量写出+逐包) | **客户端收包慢/客户端网络差反向压 TCP** |
+| `forward` | = exec + recv + cli_send(合计,兼容旧口径) | 同三子阶段之和 |
+
+实现要点:
+
+- 打点在 `proto/result.rs` 转发层:`ForwardCount` 新增 `exec_us/recv_us/cli_send_us`,
+  读后端包走 `timed_read_backend`(首包→exec,后续→recv),发客户端走
+  `timed_send_frontend`/flush 内联计时。**分段时钟口径**:只计各 await 的实际耗时,
+  互不重叠;`exec+recv+cli_send ≤ forward`,差值为代理自身 CPU/拷贝(µs 级)。
+  包间等待发生在下一次读挂起期间,自然归入 `recv`,无需额外计时。
+- `metric.rs`:`QueryRecord/SlowQuery` 各加 3 字段(+forward 保留);
+  `Metrics` 加 `stage_{exec,recv,cli_send}_us` 计数器;`shard_stage_us` 扩为 `[u64; 8]`;
+  `record_query_stages` 签名扩为 9 参数。
+- 暴露:`/api/status` 的 `stage_avg_us`/`shard_stages[].avg_us` 加三键;
+  `/api/recent`、`/api/slow` 每条加 `exec_us/recv_us/cli_send_us`;
+  `/metrics` 新增 gauge 族 `newproxy_query_stage_seconds{stage="..."}`(8 阶段平均,µs→秒);
+  慢查询日志 WARN 增加 `exec_us/recv_us/cli_send_us` 字段;面板(阶段卡片/分片表/
+  最近查询/慢查询/CSV 导出)同步加列。
+
+### 主库读路由标识(2026-09-10)
+
+针对"用户强制主库(事务/会话 pin)或 prepared 绑定导致 SELECT 发往主库"的归因需求,
+新增主库读标识与计数:
+
+- **决策点打标**:`handle_query` 在读写分离决策处捕获 `consistency.rs::RouteDecision.leader_reason`,
+  SELECT 走主库时按 产品用户 × 原因 计数(`record_leader_read`);走从库标 "follower";
+  从库不可用/追不平降级时改标 "follower-fallback"(`ensure_backend_ex` 返回最终生效角色)。
+- **原因枚举**:`in-transaction`(显式事务)/ `session-pinned`(SET/临时表/prepared/autocommit=0)/
+  `level-strong`(档位 strong 或未启用分流)/ `for-update-share` / `lock-in-share` /
+  `select-into` / `procedure-analyse` / `found-rows-prefix` / `user-variable` /
+  `session-function`(LAST_INSERT_ID/GET_LOCK/SLEEP 等)/ `no-statement` / `multi-statement` /
+  `follower-fallback`(降级)。
+- **暴露**:`/api/status` 新增 `leader_reads[{user,reason,count}]` + `leader_reads_total`;
+  `/api/recent`、`/api/slow` 每条新增 `route` 字段;`/metrics` 新增
+  `newproxy_leader_reads_total{user,reason}`(按用户×原因)与 `newproxy_leader_reads_total`(总数);
+  慢/普通查询日志新增 `route=` 字段;面板新增"主库读分布"表与最近/慢查询"路由"列。
 
 ## 9. 维护约定
 
